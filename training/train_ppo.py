@@ -22,18 +22,20 @@ ROOT=Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0,str(ROOT))
 
-from CALSESD_internal.env import BatchCVRPEnv,CVRPGridEnvForLatent
-from CALSESD_internal.models import GeometryDynamicPointerPolicy
-from CALSESD_internal.models.hybrid_latent_search import HybridLatentSearch,HybridSearchConfig
-from CALSESD_internal.models.value import ValueNetwork
-from CALSESD_internal.training.ppo_config import parse_args,validate_config
-from CALSESD_internal.training.ablation_config import resolve_ablation,validation_settings,ablation_manifest
-from CALSESD_internal.training.online_trigger import OnlineTrigger
-from CALSESD_internal.training.ppo_rollout import ActorOnlyCollector,Rollout,VALUE_SEMANTICS,BOOTSTRAP_SEMANTICS
-import CALSESD_internal.training.ppo_update as update_io
-import CALSESD_internal.training.validation as validation_io
-import CALSESD_internal.training.checkpoint as checkpoint_io
-import CALSESD_internal.training.compact_logging as logging_io
+
+from CALSESD.models import GeometryDynamicPointerPolicy
+from CALSESD.models.hybrid_latent_search import HybridLatentSearch
+from CALSESD.models.value import ValueNetwork
+from CALSESD.training.ppo_config import parse_args,validate_config
+from CALSESD.training.online_trigger import OnlineTrigger
+from CALSESD.training.ablation_config import (resolve_ablation,validation_settings,
+    ablation_manifest,build_search_config)
+from CALSESD.training.env_factory import make_env
+from CALSESD.training.ppo_rollout import ActorOnlyCollector,Rollout,VALUE_SEMANTICS,BOOTSTRAP_SEMANTICS
+import CALSESD.training.ppo_update as update_io
+import CALSESD.training.validation as validation_io
+import CALSESD.training.checkpoint as checkpoint_io
+import CALSESD.training.compact_logging as logging_io
 
 PROJECT_ROOT=Path(__file__).resolve().parents[1]
 CORE_METRICS=('policy_loss','value_loss','entropy','approx_kl')
@@ -147,16 +149,8 @@ def _output_base(value):
 
 
 def _build_search_config(cfg,plan):
-    settings=dict(candidates=cfg.reopt_candidates,generations=cfg.evolution_generations,
-        latent_bound=cfg.latent_bound,min_gain=cfg.reopt_min_gain,gradient_steps=cfg.gradient_steps,
-        gradient_lr=cfg.gradient_lr,max_gradient_norm=cfg.max_gradient_norm,uncertainty_kappa=cfg.uncertainty_kappa,
-        elite_fraction=cfg.elite_fraction,immigrant_fraction=cfg.immigrant_fraction,
-        crossover_alpha_min=cfg.crossover_alpha_min,crossover_alpha_max=cfg.crossover_alpha_max,
-        mutation_sigma_base=cfg.mutation_sigma_base,mutation_sigma_min=cfg.mutation_sigma_min,
-        mutation_sigma_max=cfg.mutation_sigma_max,seed=cfg.seed+2000,acceptance='critic',
-        evaluation_backend='critic',search_scope='episode',budget_seconds=cfg.online_search_budget_seconds)
-    settings.update(plan.search_overrides)
-    result=HybridSearchConfig(**settings);result.validate();return result
+    # Single source of truth; checkpoint._identity compares against this exact builder.
+    return build_search_config(cfg)
 
 
 def _configure_networks(cfg,actor,critic):
@@ -249,12 +243,7 @@ def main():
     if out_base.resolve()==ckpt_base.resolve():raise ValueError('output and checkpoint directories must differ')
     out_dir,ckpt_dir=out_base/stamp,ckpt_base/stamp
     out_dir.mkdir(parents=True,exist_ok=False);ckpt_dir.mkdir(parents=True,exist_ok=False)
-    base=CVRPGridEnvForLatent(grid_size=cfg.grid_size,vehicle_capacity=cfg.vehicle_capacity,
-        num_customers=cfg.num_customers,seed=cfg.seed,device=device,demand_noise_std=cfg.demand_noise_std,
-        traffic_noise_std=cfg.traffic_noise_std,traffic_trend=cfg.traffic_trend,traffic_beta=cfg.traffic_beta,
-        max_steps=cfg.max_episode_steps)
-    env=BatchCVRPEnv(base,cfg.batch_size,valid_reward=0.,step_penalty=0.,max_steps=cfg.max_episode_steps)
-    env.failure_penalty=cfg.failure_penalty
+    env=make_env(cfg,cfg.seed,device)   # same construction path as validation
     trigger=OnlineTrigger.from_config(cfg);env.set_online_trigger(trigger)
     actor=GeometryDynamicPointerPolicy(dynamic_input_dim=6,geometry_input_dim=2,hidden_dim=cfg.hidden_dim,
         dynamic_dim=cfg.dynamic_dim,latent_dim=cfg.latent_dim,num_heads=cfg.num_heads,
