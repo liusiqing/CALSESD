@@ -15,6 +15,10 @@ from torch_geometric.data import Data
 
 
 class BatchCVRPEnv:
+    _SNAPSHOT_TENSORS = (
+        'current_nodes', 'vehicle_loads', 'total_costs', 'dones', 'terminated', 'truncated',
+        'steps', 'visited_masks', 'revealed_masks', 'actual_demands_tensor', 'expected_demands_tensor',
+    )
     def __init__(self, original_env, batch_size: int, valid_reward: Optional[float] = None,
                  step_penalty: Optional[float] = None, max_steps: Optional[int] = None):
         if batch_size < 1:
@@ -33,6 +37,7 @@ class BatchCVRPEnv:
         self.norm_dist = max(float(original_env.grid_size) * float(os.environ.get("DVRP_NORM_DIST_K", 1.5)), 1e-6)
         self.valid_reward = 0.0 if valid_reward is None else float(valid_reward)
         self.step_penalty = 0.0 if step_penalty is None else float(step_penalty)
+        self._instance_id = 0
         self._build_edges()
 
     def _build_edges(self):
@@ -109,6 +114,7 @@ class BatchCVRPEnv:
         elif online_completed_updates is not None or online_training is not None:
             raise RuntimeError('online reset options require a bound online trigger')
         self.env.reset(num_customers)
+        self._instance_id += 1
         self.num_nodes = self.env.num_nodes
         self.norm_capacity = float(self.env.vehicle_capacity)
         self.norm_dist = max(float(self.env.grid_size) * float(os.environ.get("DVRP_NORM_DIST_K", 1.5)), 1e-6)
@@ -132,20 +138,36 @@ class BatchCVRPEnv:
         if self.online_trigger is not None:
             self.online_trigger.reset_episode(completed_updates=online_completed_updates, training=online_training)
         return self.get_batch_state()
+    def snapshot(self):
+        """Copy all mutable batch state plus the shared traffic/RNG state of this instance."""
+        if not hasattr(self, 'steps'):
+        raise RuntimeError('call reset() before snapshot()')
+        data = {name: getattr(self, name).clone() for name in self._SNAPSHOT_TENSORS}
+        data['env'] = self.env.save_state()
+        data['instance_id'] = self._instance_id
+        return data
 
+    def restore(self, snapshot):
+        """Rewind to a snapshot taken on the SAME instance. Does not touch the online trigger."""
+        if snapshot['instance_id'] != self._instance_id:
+            raise ValueError('snapshot belongs to a different instance; reset() invalidates snapshots')
+        for name in self._SNAPSHOT_TENSORS:
+            getattr(self, name).copy_(snapshot[name])
+        self.env.load_state(snapshot['env'])
+        self._update_edge_attr()
     def _initialize_demands(self, rows):
         if rows.numel() == 0:
             return
-        n = rows.numel()
-        for node in self.env.customer_nodes:
-            expected = float(self.env.expected_demands[node])
-            self.expected_demands_tensor[rows, node] = expected
-            if getattr(self.env, "demand_mode", None) == "uchoa":
-                sampled = np.full(n, expected, dtype=np.float32)
-            else:
-                sampled = np.clip(np.rint(self.env.np_rng.normal(expected, self.env.demand_noise_std, size=n)),
-                                  1, self.env.vehicle_capacity).astype(np.float32)
-            self.actual_demands_tensor[rows, node] = torch.as_tensor(sampled, device=self.device)
+         n = rows.numel()
+         for node in self.env.customer_nodes:
+             expected = float(self.env.expected_demands[node])
+             self.expected_demands_tensor[rows, node] = expected
+             if getattr(self.env, "demand_mode", None) == "uchoa":
+                 sampled = np.full(n, expected, dtype=np.float32)
+             else:
+                 sampled = np.clip(np.rint(self.env.np_rng.normal(expected, self.env.demand_noise_std, size=n)),
+                                      1, self.env.vehicle_capacity).astype(np.float32)
+             self.actual_demands_tensor[rows, node] = torch.as_tensor(sampled, device=self.device)
 
     def reset_done(self, indices=None):
         """Reset ONLY rows currently done; return a new batched graph observation.
