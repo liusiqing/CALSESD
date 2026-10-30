@@ -12,11 +12,12 @@ import math
 from numbers import Integral
 from time import perf_counter
 import torch
-from CALSESD_internal.models import build_geometry_data
-from CALSESD_internal.training.online_trigger import OnlineTrigger,OnlineTriggerConfig
-from CALSESD_internal.training.ablation_config import resolve_ablation
-from CALSESD_internal.training.inference_timing import InferenceTiming
-from CALSESD_internal.training.rng_state import preserve_rng
+from CALSESD.models import build_geometry_data
+from CALSESD.models.hybrid_latent_search import search_stream_seed
+from CALSESD.training.online_trigger import OnlineTrigger,OnlineTriggerConfig
+from CALSESD.training.ablation_config import resolve_ablation
+from CALSESD.training.inference_timing import InferenceTiming
+from CALSESD.training.rng_state import preserve_rng
 
 VALUE_SEMANTICS='online_actor_controller_v1'
 BOOTSTRAP_SEMANTICS='online_post_trigger_next_decision_v1'
@@ -35,6 +36,7 @@ class Rollout:
     rewards:list=field(default_factory=list)
     boundaries:list=field(default_factory=list)
     values:list=field(default_factory=list)
+    eep_values:list=field(default_factory=list)
     next_values:list=field(default_factory=list)
     latent_switch_masks:list=field(default_factory=list)
     search_due_masks:list=field(default_factory=list)
@@ -112,6 +114,7 @@ class ActorOnlyCollector:
         self.search=search;self.online_trigger=trigger;self.ablation_plan=resolve_ablation(cfg)
         self.episode_csv,self.step_csv=episode_csv,step_csv
         self.global_step=0;self.critic_updates=0;self.z=None
+        self.last_incumbent_z=None;self.z_resampled_rows=0
         self.last_search_status={};self.last_search_diagnostics={};self.enhancement_events=[]
         self.inference_timing=InferenceTiming(env.device)
 
@@ -120,11 +123,25 @@ class ActorOnlyCollector:
         if (not torch.is_tensor(z) or z.shape!=(c.batch_size,c.latent_dim) or not z.is_floating_point()
                 or not bool(torch.isfinite(z).all()) or bool((z.abs()>c.latent_bound).any())):
             raise ValueError('invalid persistent/selected z')
+    def _resample_latents(self,update):
+        c=self.cfg;p=float(c.z_resample_prob)
+        self.z_resampled_rows=0
+        if p<=0.:return
+        device=torch.device(self.env.device)
+        if device.type=='cuda' and device.index is None:device=torch.device('cuda',torch.cuda.current_device())
+        g=torch.Generator(device=device)
+        g.manual_seed(search_stream_seed(c.seed,update,'z_resample'))   # 与是否 resume 无关,可复现
+        rows=torch.rand(c.batch_size,device=device,generator=g)<p
+        fresh=(2*torch.rand(c.batch_size,c.latent_dim,device=device,generator=g)-1)*c.latent_bound
+        self.z=torch.where(rows[:,None],fresh.to(self.z.dtype),self.z).detach().clone()
+        self.z_resampled_rows=int(rows.sum())
+        self._validate_z(self.z)
 
     @torch.no_grad()
     def _decision_state(self,state,update):
         """Return non-pending state and actual due/switch masks for this action."""
         e=self.env
+        self.last_incumbent_z=None
         decision=e.online_decision()
         due=torch.as_tensor(decision.due,dtype=torch.bool,device=e.device)
         switches=torch.zeros_like(due)
@@ -132,8 +149,7 @@ class ActorOnlyCollector:
             reasons=list(decision.reasons),due_rows=int(due.sum()),called=False)
         if not decision.should_search:return state,due,switches,None
         incumbent=self.z.detach().clone();_synchronize(e.device);started=perf_counter()
-        # Retain token BEFORE state construction, so an encoding/schema failure
-        # cannot leave the trigger pending without a token available for cleanup.
+        self.last_incumbent_z=incumbent
         token=self.online_trigger.begin_attempt(decision)
         success=False;timed_out=False;candidate=incumbent;report=None
         # Cleanup must remain possible without allocating/copying CUDA tensors.
@@ -210,6 +226,7 @@ class ActorOnlyCollector:
         if self.z is None:
             self.z=self.policy.sample_prior(c.batch_size,c.latent_dim,e.device,c.latent_bound).detach().clone()
         self._validate_z(self.z)
+        self._resample_latents(update)
         geometry_input=build_geometry_data(state,e.env.baseline_distance_matrix,coords=e.env.coords).clone().detach()
         with torch.no_grad():
             with self.inference_timing.measure('actor_geometry'):geometry=self.policy.encode_geometry(geometry_input)
@@ -227,9 +244,13 @@ class ActorOnlyCollector:
             if getattr(state,'online_search_pending',None) is not False:raise RuntimeError('cannot execute a pending-search state')
             with torch.no_grad():
                 with self.inference_timing.measure('critic_forward'):
-                    value=self.critic.mean_value(state,z)
+                    features=self.critic.encode_state(state)
+                    value=self.critic.evaluate_features(features,z).mean(0)
+                    keep=value
+                    if c.gae_keep_bootstrap and bool(switched.any()):
+                        keep=torch.where(switched,self.critic.evaluate_features(features,self.last_incumbent_z).mean(0),value)
                 if value.shape!=active.shape or not bool(torch.isfinite(value[active]).all()):raise ValueError('invalid current value')
-                value=value.masked_fill(~active,0.)
+                value=value.masked_fill(~active,0.);keep=keep.masked_fill(~active,0.)
                 if r.next_values:
                     continuing=r.valid_masks[-1]&~r.boundaries[-1]
                     if bool((continuing & ~active).any()):raise RuntimeError('trajectory disappeared before next decision')
@@ -251,8 +272,9 @@ class ActorOnlyCollector:
             r.masks.append(mask.detach().clone());r.actions.append(action.detach().clone())
             r.log_probs.append(logp.detach().clone());r.old_logits.append(logits.detach().clone())
             r.valid_masks.append(active);r.actor_masks.append(active.clone())
-            r.rewards.append(reward.detach().clone());r.boundaries.append(done)
+            r.rewards.append((reward*c.reward_scale).detach().clone());r.boundaries.append(done)
             r.values.append(value.detach().clone())
+            r.keep_values.append(keep.detach().clone())
             # Terminal/invalid entries remain zero; continuing entries are filled
             # at the next actual decision, never by prematurely searching twice.
             r.next_values.append(torch.zeros_like(value))
@@ -279,6 +301,7 @@ class ActorOnlyCollector:
             search_scope='episode',schedule='periodic',ppo_env_steps=r.ppo_env_steps,search_calls=r.evolution_search_calls,
             attempted_rows=r.due_rows,switched_rows=r.switched_rows,search_status=deepcopy(self.last_search_status),
             row_attempts=list(self.online_trigger.attempts),batch_search_seconds=self.online_trigger.batch_seconds_used,
+                                z_resampled_rows=self.z_resampled_rows,
             rollout_episodes=0,rollout_env_steps=0,rollout_batch_steps=0,rollout_counts_complete=True)
         return r
 
