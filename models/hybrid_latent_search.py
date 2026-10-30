@@ -40,6 +40,8 @@ class HybridSearchConfig:
     scale_max_version_lag:int=50
     candidate_chunk_size:int=32
     min_gain:float=.1
+    min_gain_ratio:float=0.
+    lcb_lambda:float=0.
     budget_seconds:float=1.
     seed:int=42
     refinement_mode:str='value_gradient'
@@ -59,7 +61,8 @@ class HybridSearchConfig:
             if not isinstance(getattr(self,key),bool):raise ValueError(f'invalid {key}')
         keys=('latent_bound','elite_fraction','immigrant_fraction','crossover_alpha_min','crossover_alpha_max',
               'gradient_lr','max_gradient_norm','mutation_sigma_base','mutation_sigma_min','mutation_sigma_max',
-              'uncertainty_kappa','scale_decay','scale_floor','min_gain','budget_seconds')
+              'uncertainty_kappa','scale_decay','scale_floor','min_gain','budget_seconds'
+              'min_gain_ratio','lcb_lambda')
         for key in keys:
             value=getattr(self,key)
             if isinstance(value,bool) or not isinstance(value,Real) or not math.isfinite(value):raise ValueError(f'invalid {key}')
@@ -68,7 +71,7 @@ class HybridSearchConfig:
         if not 0<=self.crossover_alpha_min<=self.crossover_alpha_max<=1:raise ValueError('invalid crossover')
         if not 0<self.mutation_sigma_min<=self.mutation_sigma_base<=self.mutation_sigma_max:raise ValueError('invalid mutation scales')
         if not 0<=self.scale_decay<1:raise ValueError('invalid scale decay')
-        if min(self.gradient_lr,self.uncertainty_kappa,self.min_gain,self.budget_seconds)<0:raise ValueError('negative search scale')
+        if min(self.gradient_lr,self.uncertainty_kappa,self.min_gain,self.budget_seconds,self.min_gain_ratio,self.lcb_lambda)<0:raise ValueError('negative search scale')
         if self.refinement_mode not in ('none','value_gradient','random_matched'):raise ValueError('invalid refinement_mode')
         if (self.search_scope,self.evaluation_backend,self.acceptance)!=('episode','critic','critic'):
             raise ValueError('this phase supports only episode/current-state Critic scoring and acceptance')
@@ -172,10 +175,12 @@ class HybridLatentSearch:
         if out.shape!=(int(critic.n_critics),features.size(0)) or not bool(torch.isfinite(out).all()):raise ValueError('invalid individual values')
         _check_deadline(self._deadline);return out
 
+    def _conservative(self,heads):
+        mean=heads.mean(0);lam=self.config.lcb_lambda
+        return mean-lam*heads.std(0,unbiased=False) if lam>0 else mean
     def _score(self,critic,features,population):
         self.last_diagnostics['population_evaluations']+=1
-        return self._heads(critic,features,population).mean(0)
-
+        return self._conservative(self._heads(critic,features,population))
     def _initial_population(self,z,due,archive,generator):
         c=self.config;bank=z[due].detach()
         if archive is not None:
@@ -277,7 +282,7 @@ class HybridLatentSearch:
                 incumbent=original[due]
                 base_heads=self._individual_heads(critic,features,incumbent);baseline=base_heads.mean(0)
                 need_std=(c.adaptive_gradient_trust or c.adaptive_mutation or c.record_refinement_diagnostics
-                    or (c.refinement_mode!='none' and c.gradient_steps>0 and c.gradient_lr>0))
+                    or (c.refinement_mode!='none' and c.gradient_steps>0 and c.gradient_lr>0) or c.min_gain_ratio>0)
                 scale=None
                 if need_std:
                     std=base_heads.std(0,unbiased=False);scale=self.update_uncertainty_scale(std,model_version)
@@ -309,12 +314,16 @@ class HybridLatentSearch:
                     if immigrants:parts.append((2*torch.rand(immigrants,D,device=z.device,dtype=z.dtype,generator=self._rng(z.device,'immigrants',call,generation))-1)*c.latent_bound)
                     population=torch.cat(parts,0).detach();d['generation_stats'].append(stats);d['generations_completed']+=1
                 final=self._score(critic,features,population);best,index=final.max(1)
-                proposal=population[index];gain=best-baseline
-                accepted=(gain>c.min_gain)&(proposal!=incumbent).any(1)
+                lam=c.lcb_lambda
+                base_score=baseline-lam*base_heads.std(0,unbiased=False) if lam>0 else baseline
+                proposal=population[index];gain=best-base_score
+                threshold=c.min_gain+c.min_gain_ratio*(scale if scale is not None else 0.)
+                accepted=(gain>threshold)&(proposal!=incumbent).any(1)
                 selected=torch.where(accepted[:,None],proposal,incumbent)
                 updated=original.clone();updated[due]=selected;switched[due]=accepted
                 d.update(proposed_rows=int(accepted.sum()),predicted_gain_mean=float(gain.mean()),selection_gain_mean=float(gain.mean()),
-                    population_diversity=float(population.float().std(0,unbiased=False).mean()))
+                    population_diversity=float(population.float().std(0,unbiased=False).mean()),
+                    acceptance_threshold=float(threshold))
                 _check_deadline(deadline)
                 d.update(switched_rows=int(switched.sum()),accepted_predicted_gain_mean=float(gain[accepted].mean()) if bool(accepted.any()) else 0.,elapsed_seconds=perf_counter()-started)
                 return updated.detach().clone(),switched.detach().clone()
