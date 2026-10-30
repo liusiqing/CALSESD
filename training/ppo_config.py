@@ -29,7 +29,7 @@ class PPOConfig:
     num_customers: int = 100
     vehicle_capacity: int = 15
     max_episode_steps: int = 200
-    failure_penalty: float = 100.0
+    failure_penalty: float = 2.0
     demand_noise_std: float = 1.0
     traffic_noise_std: float = 1.0
     traffic_trend: float = 5.0
@@ -51,6 +51,8 @@ class PPOConfig:
     entropy_coef: float = 0.01
     max_grad_norm: float = 0.5
     bootstrap_prob: float = 0.8
+    reward_scale: float = 0.1            # 固定奖励缩放,Critic 目标落在 O(1~10)
+    gae_keep_bootstrap: bool = True      # 切换步用 V(s',z_old) 做 bootstrap
 
     # Actor / Critic network.
     hidden_dim: int = 128
@@ -62,6 +64,7 @@ class PPOConfig:
     dropout: float = 0.0
     n_critics: int = 4
     latent_bound: float = 1.0
+    z_resample_prob: float = 0.5         # 每个 episode 开始时按行重采样 z 的概率
     actor_cache_static_fusion: bool = True
     critic_cache_static: bool = True
     critic_static_cache_size: int = 4
@@ -79,11 +82,13 @@ class PPOConfig:
 
     # Shared latent population search.
     reopt_candidates: int = 64
-    evolution_generations: int = 10
+    evolution_generations: int = 3
     gradient_steps: int = 1  # exp1 requires 1; its none variant applies 0 steps.
     gradient_lr: float = 0.05
     uncertainty_kappa: float = 1.0
-    reopt_min_gain: float = 0.1
+    reopt_min_gain: float = 0.0
+    reopt_min_gain_ratio: float = 1.0    # 接受阈值 = min_gain + ratio * 不确定性尺度
+    lcb_lambda: float = 1.0              # 保守得分 = 均值 - lambda * 集成标准差
     elite_fraction: float = 0.25
     immigrant_fraction: float = 0.125
     mutation_sigma_base: float = 0.15
@@ -103,7 +108,8 @@ class PPOConfig:
 
     # system: online controller; policy: no search with a common seeded prior.
     validation_interval: int = 50
-    validation_seeds: int = 4
+    validation_seeds: int = 16
+    validation_paired: bool = True       # 每次验证同时跑 policy 协议,记录搜索收益
     validation_seed: int = 1000000
     validation_protocol: str = 'system'
     validation_initial_latent_source: str = 'common'  # policy always uses common.
@@ -125,7 +131,8 @@ _HIDDEN_FIELDS = {
     'immigrant_fraction', 'mutation_sigma_base', 'mutation_sigma_min',
     'mutation_sigma_max', 'max_gradient_norm', 'crossover_alpha_min',
     'crossover_alpha_max', 'validation_seed', 'checkpoint_interval',
-    'save_step_csv', 'ablation_record_diagnostics',
+    'save_step_csv', 'ablation_record_diagnostics','reward_scale', 'gae_keep_bootstrap', 'z_resample_prob',
+    'reopt_min_gain_ratio', 'lcb_lambda',
 }
 
 
@@ -232,14 +239,17 @@ def validate_config(cfg):
         raise ValueError('PPO/网络/交通参数范围错误')
     positive_scales = (
         'learning_rate', 'value_learning_rate', 'max_grad_norm', 'latent_bound',
-        'max_gradient_norm', 'failure_penalty',
+        'max_gradient_norm', 'failure_penalty', 'reward_scale',
     )
     if any(getattr(cfg, name) <= 0 for name in positive_scales):
         raise ValueError('学习率、裁剪量和任务尺度必须为正')
     nonnegative_scales = (
         'value_coef', 'entropy_coef', 'demand_noise_std', 'traffic_noise_std',
         'gradient_lr', 'uncertainty_kappa', 'reopt_min_gain',
+        'reopt_min_gain_ratio', 'lcb_lambda',
     )
+    if not 0.0 <= cfg.z_resample_prob <= 1.0:
+        raise ValueError('z_resample_prob必须在[0,1]内')
     if any(getattr(cfg, name) < 0 for name in nonnegative_scales):
         raise ValueError('损失系数或搜索尺度不能为负')
     if cfg.target_kl is not None and cfg.target_kl <= 0:
