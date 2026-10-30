@@ -15,7 +15,7 @@ __all__ = ['compute_gae', 'make_bootstrap_mask', 'update_actor_critic', 'update_
 
 
 def compute_gae(rewards, boundaries, bootstrap_values, values, gamma, gae_lambda,
-                valid_masks=None):
+                valid_masks=None, carry=None):
     if rewards.ndim != 2 or rewards.size(0) == 0:
         raise ValueError('GAE requires nonempty [T,B] inputs')
     if boundaries.shape != rewards.shape or values.shape != rewards.shape or bootstrap_values.shape != rewards.shape:
@@ -25,11 +25,14 @@ def compute_gae(rewards, boundaries, bootstrap_values, values, gamma, gae_lambda
     valid = torch.ones_like(boundaries, dtype=torch.bool) if valid_masks is None else valid_masks.bool()
     if valid.shape != rewards.shape:
         raise ValueError('GAE valid mask shape mismatch')
+    carry = torch.zeros_like(rewards) if carry is None else carry
+    if carry.shape != rewards.shape:
+        raise ValueError('GAE carry shape mismatch')
     advantage = torch.zeros_like(rewards)
     running = torch.zeros_like(rewards[0])
     for t in reversed(range(rewards.shape[0])):
         delta = rewards[t] + gamma * bootstrap_values[t] - values[t]
-        running = delta + gamma * gae_lambda * (~boundaries[t]).to(rewards.dtype) * running
+        running = delta + gamma * gae_lambda * (~boundaries[t]).to(rewards.dtype) * (running + carry[t])
         running = torch.where(valid[t], running, torch.zeros_like(running))
         advantage[t] = running
     returns = torch.where(valid, advantage + values, torch.zeros_like(values))
@@ -157,6 +160,15 @@ def _validate_online_rollout(cfg,critic,r):
         continuing=valid[:-1]&~boundaries[:-1]
         if not torch.equal(next_values[:-1][continuing],values[1:][continuing]):
             raise ValueError('bootstrap does not use the actual next post-trigger decision value')
+    if cfg.gae_keep_bootstrap:
+        if len(r.keep_values)!=T:raise ValueError('rollout lacks keep_values; recollect with the keep-bootstrap collector')
+    keep=torch.stack(r.keep_values)
+        if (keep.shape!=valid.shape or keep.device!=valid.device or not keep.is_floating_point()
+                or keep.requires_grad or not bool(torch.isfinite(keep[valid]).all())):
+            raise ValueError('invalid keep_values')
+        same=valid&~switched
+        if not torch.equal(keep[same],values[same]):
+            raise ValueError('keep value must equal executed value on rows without a latent switch')
     z=torch.stack(r.latents)
     if (z.shape!=(T,cfg.batch_size,cfg.latent_dim) or z.device!=valid.device or not z.is_floating_point() or z.requires_grad
             or not bool(torch.isfinite(z).all()) or bool((z.abs()>cfg.latent_bound).any())):
@@ -189,8 +201,15 @@ def update_actor_critic(cfg,policy,critic,optimizers,r,device):
         raise ValueError("Actor and unified Critic must not share parameters")
     policy.eval();critic.eval()
     valid,actor,values,next_values=_validate_online_rollout(cfg,critic,r)
-    advantages,returns=compute_gae(torch.stack(r.rewards),torch.stack(r.boundaries),
-        next_values,values,cfg.gamma,cfg.gae_lambda,valid)
+    rewards=torch.stack(r.rewards);boundaries=torch.stack(r.boundaries)
+    bootstrap,carry=next_values,None
+    if cfg.gae_keep_bootstrap:
+        keep=torch.stack(r.keep_values)
+        continuing=valid[:-1]&~boundaries[:-1]
+        bootstrap=torch.zeros_like(next_values);carry=torch.zeros_like(values)
+        bootstrap[:-1]=torch.where(continuing,keep[1:],torch.zeros_like(keep[1:]))
+        carry[:-1]=torch.where(continuing,values[1:]-keep[1:],torch.zeros_like(keep[1:]))
+    advantages,returns=compute_gae(rewards,boundaries,bootstrap,values,cfg.gamma,cfg.gae_lambda,valid,carry)
     if bool(actor.any()):
         a=advantages[actor]
         advantages=torch.where(actor,(advantages-a.mean())/a.std(unbiased=False).clamp_min(1e-8),0.)
