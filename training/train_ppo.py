@@ -304,8 +304,20 @@ def main():
                         validation=validation_io.validate_controller(cfg,actor,critic,collector.z,device,
                             episode_writer=logs.validation_episode_csv,update=update,protocol=cfg.validation_protocol,
                             diagnostics_sink=logs.event)
+                        paired=None
+                        if cfg.validation_paired and cfg.validation_protocol=='system':
+                            paired=validation_io.validate_controller(cfg,actor,critic,collector.z,device,
+                                episode_writer=None,update=update,protocol='policy',diagnostics_sink=None)
                     key=_validation_key(validation,manifest['validation_settings'],cfg)
                     logs.validation_csv.writerow(logging_io.build_validation_row(update,validation,timer.seconds['validation']))
+                    if paired is not None:
+                        sys_cost,pol_cost=validation.get('mean_penalized_cost'),paired.get('mean_penalized_cost')
+                        logs.event(dict(type='paired_validation',update=update,
+                            system_penalized_cost=sys_cost,policy_penalized_cost=pol_cost,
+                            search_gain=(pol_cost-sys_cost) if None not in (sys_cost,pol_cost) else None,
+                            system_completion_rate=validation.get('completion_rate'),
+                            policy_completion_rate=paired.get('completion_rate'),
+                            latent_source=validation['validation_details'].get('latent_source')))
                 with timer.phase('checkpoint'):
                     if validation is not None and key>best:
                         best=key;checkpoint_io.save_checkpoint(ckpt_dir/'checkpoint_best.pt',cfg,models,optimizers,update,best,r,collector,history)
