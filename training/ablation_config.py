@@ -110,6 +110,7 @@ def build_search_config(cfg, config_cls=None):
         min_gain=cfg.reopt_min_gain,
         min_gain_ratio=cfg.reopt_min_gain_ratio,
         lcb_lambda=cfg.lcb_lambda,
+        normalize_gradient=cfg.latent_gradient_normalize,
         gradient_steps=cfg.gradient_steps,
         gradient_lr=cfg.gradient_lr,
         max_gradient_norm=cfg.max_gradient_norm,
