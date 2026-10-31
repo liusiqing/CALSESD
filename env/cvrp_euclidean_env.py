@@ -124,7 +124,7 @@ class CVRPEuclideanEnvForLatent(CVRPEuclideanEnv):
                  device: str | torch.device | None = None, demand_noise_std: float = 1.0,
                  traffic_noise_std: float = 1.0, traffic_trend: float = 5.0,
                  traffic_beta: float = 0.07, demand_mode: str = "uchoa",
-                 synth_capacity: int = 15, max_steps: Optional[int] = None
+                 synth_capacity: int = 15, max_steps: Optional[int] = None,
                  traffic_trend_mode: str = "additive", traffic_trend_ratio: float = 0.3):
         super().__init__(
             coords=coords, demands=demands, capacity=capacity, depot_idx=depot_idx,
