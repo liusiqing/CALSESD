@@ -147,7 +147,7 @@ class BatchCVRPEnv:
     def snapshot(self):
         """Copy all mutable batch state plus the shared traffic/RNG state of this instance."""
         if not hasattr(self, 'steps'):
-        raise RuntimeError('call reset() before snapshot()')
+            raise RuntimeError('call reset() before snapshot()')
         data = {name: getattr(self, name).clone() for name in self._SNAPSHOT_TENSORS}
         data['env'] = self.env.save_state()
         data['instance_id'] = self._instance_id
