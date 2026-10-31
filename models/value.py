@@ -1,8 +1,7 @@
 """Online Actor-controller value ensemble with static geometry caching.
 
-Original geometry/dynamic/fusion/traffic-GAT/pooling modules are retained.
-Only context fusion is changed: physical context[:2] + online_context[6] +
-two task summaries. Legacy route-planner context[2:] is not used.
+Context fusion: physical context[:2] (traffic phase, remaining episode fraction)
+online_context[6] + two task summaries.
 
 Targets must include the actual future online-controller switches. The network
 alone does not make old fixed-z GAE/returns correct; collector/update adaptation
