@@ -8,9 +8,10 @@ from typing import Any, Dict, Optional
 import numpy as np
 import torch
 from torch_geometric.data import Data
-
+from .traffic import generate_traffic_matrix
 
 class CVRPGridEnv:
+    build_state_on_reset = True 
     def __init__(
         self,
         grid_size: int = 15,
@@ -22,6 +23,8 @@ class CVRPGridEnv:
         traffic_transition_beta: float = 0.07,
         traffic_noise_std: float = 1.0,
         traffic_trend: float = 5.0,
+        traffic_trend_mode: str = "additive",
+        traffic_trend_ratio: float = 0.3,
         use_knn_graph: bool = False,
         k_neighbors: int = 200,
         traffic_update_interval: Optional[int] = None,
@@ -35,6 +38,8 @@ class CVRPGridEnv:
             raise ValueError("traffic_transition_beta must be in [0, 1].")
         if demand_noise_std < 0 or traffic_noise_std < 0:
             raise ValueError("Noise standard deviations must be non-negative.")
+        if traffic_trend_mode not in ("additive", "relative") or traffic_trend_ratio < 0:
+            raise ValueError("invalid traffic_trend_mode/traffic_trend_ratio.")
 
         self.grid_size = int(grid_size)
         self.num_nodes = self.grid_size * self.grid_size
@@ -46,6 +51,8 @@ class CVRPGridEnv:
         self.traffic_transition_beta = float(traffic_transition_beta)
         self.traffic_noise_std = float(traffic_noise_std)
         self.traffic_trend = float(traffic_trend)
+        self.traffic_trend_mode = traffic_trend_mode
+        self.traffic_trend_ratio = float(traffic_trend_ratio)
         self.use_knn_graph = bool(use_knn_graph)
         self.k_neighbors = int(k_neighbors)
         self.traffic_update_interval = int(
@@ -112,21 +119,14 @@ class CVRPGridEnv:
         self.time_step = 0
         self.current_traffic_matrix = self.baseline_distance_matrix.copy()
         self.distance_matrix = self._generate_traffic_matrix()
-        return self._get_state()
+        return self._get_state() if self.build_state_on_reset else None
 
     def _generate_traffic_matrix(self) -> np.ndarray:
-        current = torch.as_tensor(self.current_traffic_matrix, dtype=torch.float32, device="cpu")
-        baseline = torch.as_tensor(self.baseline_distance_matrix, dtype=torch.float32, device="cpu")
-        noise = torch.randn(current.shape, generator=self._torch_generator, dtype=torch.float32) * self.traffic_noise_std
-        updated = (
-            self.traffic_transition_beta * current
-            + (1.0 - self.traffic_transition_beta) * baseline
-            + noise
-            + self.traffic_trend
-        )
-        updated = torch.maximum(updated, baseline)
-        updated.fill_diagonal_(0.0)
-        self.current_traffic_matrix = updated.numpy().astype(np.float64, copy=True)
+        self.current_traffic_matrix = generate_traffic_matrix(
+            self.current_traffic_matrix, self.baseline_distance_matrix,
+            beta=self.traffic_transition_beta, noise_std=self.traffic_noise_std,
+            trend=self.traffic_trend, generator=self._torch_generator,
+            mode=self.traffic_trend_mode, ratio=self.traffic_trend_ratio)
         self.time_step += 1
         return self.current_traffic_matrix
 
@@ -228,12 +228,14 @@ class CVRPGridEnvForLatent(CVRPGridEnv):
     def __init__(self, grid_size: int = 12, vehicle_capacity: int = 15, num_customers: int = 100,
                  seed: Optional[int] = None, device: str | torch.device | None = None,
                  demand_noise_std: float = 1.0, traffic_noise_std: float = 1.0,
-                 traffic_trend: float = 5.0, traffic_beta: float = 0.07, max_steps: Optional[int] = None):
+                 traffic_trend: float = 5.0, traffic_beta: float = 0.07, max_steps: Optional[int] = None,
+                 traffic_trend_mode: str = "additive", traffic_trend_ratio: float = 0.3):
         super().__init__(
             grid_size=grid_size, vehicle_capacity=vehicle_capacity, num_customers=num_customers,
             seed=seed, device=device, demand_noise_std=demand_noise_std,
             traffic_transition_beta=traffic_beta, traffic_noise_std=traffic_noise_std,
             traffic_trend=traffic_trend, use_knn_graph=True,
+            traffic_trend_mode=traffic_trend_mode, traffic_trend_ratio=traffic_trend_ratio,
             k_neighbors=min(40, max(1, num_customers // 5)), traffic_update_interval=5,
             max_steps=max_steps,
         )
