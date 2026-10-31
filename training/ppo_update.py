@@ -163,7 +163,7 @@ def _validate_online_rollout(cfg,critic,r):
     if cfg.gae_keep_bootstrap:
         if len(r.keep_values)!=T:
             raise ValueError('rollout lacks keep_values; recollect with the keep-bootstrap collector')
-    keep=torch.stack(r.keep_values)
+        keep=torch.stack(r.keep_values)
         if (keep.shape!=valid.shape or keep.device!=valid.device or not keep.is_floating_point()
             or keep.requires_grad or not bool(torch.isfinite(keep[valid]).all())):
             raise ValueError('invalid keep_values')
