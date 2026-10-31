@@ -38,7 +38,7 @@ class Rollout:
     rewards: list = field(default_factory=list)
     boundaries: list = field(default_factory=list)
     values: list = field(default_factory=list)
-    eep_values: list = field(default_factory=list)
+    keep_values: list = field(default_factory=list)
     next_values: list = field(default_factory=list)
     latent_switch_masks: list = field(default_factory=list)
     search_due_masks: list = field(default_factory=list)
