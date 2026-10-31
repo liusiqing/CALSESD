@@ -106,7 +106,7 @@ def resolve_ablation(cfg):
 def build_search_config(cfg, config_cls=None):
     plan = resolve_ablation(cfg)
     if config_cls is None:
-        from CALSESD_internal.models.hybrid_latent_search import HybridSearchConfig
+        from CALSESD.models.hybrid_latent_search import HybridSearchConfig
 
         config_cls = HybridSearchConfig
     args = dict(
