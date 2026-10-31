@@ -24,6 +24,7 @@ class BatchCVRPEnv:
         if batch_size < 1:
             raise ValueError("batch_size must be >= 1")
         self.env = original_env
+        original_env.build_state_on_reset = False   # 批量环境自己构造状态
         self.batch_size = int(batch_size)
         self.device = original_env.device
         self.num_nodes = original_env.num_nodes
@@ -39,6 +40,14 @@ class BatchCVRPEnv:
         self.step_penalty = 0.0 if step_penalty is None else float(step_penalty)
         self._instance_id = 0
         self._build_edges()
+
+    def _traffic(self):
+        """交通矩阵每次更新都是新对象,按对象身份缓存 GPU 张量。"""
+        matrix = self.env.distance_matrix
+        if getattr(self, '_traffic_src', None) is not matrix:
+            self._traffic_src = matrix
+            self._traffic_cache = torch.as_tensor(matrix, device=self.device, dtype=torch.float32)
+        return self._traffic_cache
 
     def _build_edges(self):
         self.base_edge_index = self.env.edge_index.to(self.device).clone()
@@ -158,16 +167,20 @@ class BatchCVRPEnv:
     def _initialize_demands(self, rows):
         if rows.numel() == 0:
             return
-         n = rows.numel()
-         for node in self.env.customer_nodes:
-             expected = float(self.env.expected_demands[node])
-             self.expected_demands_tensor[rows, node] = expected
-             if getattr(self.env, "demand_mode", None) == "uchoa":
-                 sampled = np.full(n, expected, dtype=np.float32)
-             else:
-                 sampled = np.clip(np.rint(self.env.np_rng.normal(expected, self.env.demand_noise_std, size=n)),
-                                      1, self.env.vehicle_capacity).astype(np.float32)
-             self.actual_demands_tensor[rows, node] = torch.as_tensor(sampled, device=self.device)
+        n = rows.numel()
+        nodes = torch.as_tensor(self.env.customer_nodes, device=self.device, dtype=torch.long)
+        expected = np.array([float(self.env.expected_demands[v]) for v in self.env.customer_nodes])
+        if getattr(self.env, "demand_mode", None) == "uchoa":
+            sampled = np.repeat(expected[:, None], n, axis=1)
+        else:
+            sampled = np.clip(np.rint(self.env.np_rng.normal(
+                expected[:, None], self.env.demand_noise_std, size=(len(expected), n))),
+                1, self.env.vehicle_capacity)
+        index = (rows[:, None], nodes[None, :])
+        self.expected_demands_tensor[index] = torch.as_tensor(
+            expected, dtype=torch.float32, device=self.device)[None, :].expand(n, -1)
+        self.actual_demands_tensor[index] = torch.as_tensor(
+            sampled.T, dtype=torch.float32, device=self.device)
 
     def reset_done(self, indices=None):
         """Reset ONLY rows currently done; return a new batched graph observation.
@@ -208,7 +221,7 @@ class BatchCVRPEnv:
 
     def _update_edge_attr(self):
         src, dst = self.base_edge_index
-        traffic = torch.as_tensor(self.env.distance_matrix, device=self.device, dtype=torch.float32)
+        traffic = self._traffic()
         self.batch_edge_attr = (traffic[src, dst].unsqueeze(-1) / self.norm_dist).repeat(self.batch_size, 1)
 
     def get_batch_state(self):
@@ -217,7 +230,7 @@ class BatchCVRPEnv:
         expected=self.expected_demands_tensor/self.norm_capacity
         current=(torch.arange(N,device=self.device)[None,:]==self.current_nodes[:,None]).float()
         load=(self.vehicle_loads/self.norm_capacity)[:,None].expand(-1,N)
-        traffic=torch.as_tensor(self.env.distance_matrix,device=self.device,dtype=torch.float32)
+        traffic=self._traffic()
         distance=traffic[self.current_nodes]/self.norm_dist
         x=torch.stack((demand,expected,self.visited_masks.float(),current,load,distance),-1).reshape(-1,6)
         customer=self.customer_mask[None,:].expand(B,-1)
@@ -251,19 +264,22 @@ class BatchCVRPEnv:
         if not bool(mask.any(1).all()):raise RuntimeError('No legal action; check demand feasibility')
         return mask
 
-    def step(self, actions):
+    def step(self, actions, action_mask=None, return_info: bool = False):
         if self.online_trigger is not None and self.online_trigger.pending:
             raise RuntimeError('do not advance the live environment during a pending online search')
         actions = torch.as_tensor(actions, device=self.device, dtype=torch.long).reshape(-1)
         if actions.numel() != self.batch_size or bool(((actions < 0) | (actions >= self.num_nodes)).any()):
             raise ValueError("actions must contain one valid node index per row")
         active = ~self.dones
-        legal=self.action_mask().gather(1,actions[:,None]).squeeze(1)
+        mask = self.action_mask() if action_mask is None else action_mask
+        if mask.shape != (self.batch_size, self.num_nodes):
+            raise ValueError("action_mask shape mismatch")
+        legal=mask.gather(1,actions[:,None]).squeeze(1)
         if bool((active&~legal).any()):raise ValueError("Illegal action under action_mask")
         if bool(active.any()):
             self.env._advance_traffic_if_due()
             self._update_edge_attr()
-        matrix = torch.as_tensor(self.env.distance_matrix, dtype=torch.float32, device=self.device)
+        matrix = self._traffic()
         costs = matrix[self.current_nodes, actions]
         self.total_costs[active] += costs[active]
         self.current_nodes[active] = actions[active]
@@ -289,4 +305,8 @@ class BatchCVRPEnv:
         remaining=(~self.visited_masks[:,self.customer_mask]).sum(1)
         rewards[failed]-=self.failure_penalty*(remaining[failed].float()+1.)
         rewards[~active] = 0.0
-        return self.get_batch_state(), rewards, self.dones.clone()
+        state = self.get_batch_state()
+        if return_info:
+            return state, rewards, self.dones.clone(), dict(
+                terminated=self.terminated.clone(), truncated=self.truncated.clone())
+        return state, rewards, self.dones.clone()
