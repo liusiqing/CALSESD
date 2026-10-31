@@ -30,9 +30,6 @@ class BatchCVRPEnv:
         self.num_nodes = original_env.num_nodes
         self.max_steps = max_steps if max_steps is not None else original_env.max_steps
         self.failure_penalty = 100.0
-        self.route_interval = 10
-        self.route_enabled = False
-        self.route_at_reset = False
         self._online_trigger = None
         self.norm_capacity = float(original_env.vehicle_capacity)
         self.norm_dist = max(float(original_env.grid_size) * float(os.environ.get("DVRP_NORM_DIST_K", 1.5)), 1e-6)
@@ -237,13 +234,10 @@ class BatchCVRPEnv:
         depot=(torch.arange(N,device=self.device)==self.env.depot)[None,:].expand(B,-1)
         aux=torch.stack((customer,depot,self.revealed_masks),-1).float().reshape(-1,3)
         pos=torch.as_tensor(self.env.coords,dtype=torch.float32,device=self.device)/max(1.,float(self.env.grid_size))
-        interval=max(1,self.route_interval);budget=max(1,self.max_steps or 1)
+        budget=max(1,self.max_steps or 1)
         phase=float(self.env.step_count%self.env.traffic_update_interval)/self.env.traffic_update_interval
         context=torch.stack((torch.full((B,),phase,device=self.device),
-            (1-self.steps.float()/budget).clamp(0,1),(self.steps%interval).float()/interval,
-            torch.full((B,),float(self.route_enabled),device=self.device),
-            torch.full((B,),interval/budget,device=self.device),
-            torch.full((B,),float(self.route_at_reset),device=self.device)),-1)
+                             (1-self.steps.float()/budget).clamp(0,1)),-1)
         state=Data(x=x,edge_index=self.batch_edge_index,edge_attr=self.batch_edge_attr,
                    batch=self.batch_vec,pos=pos.repeat(B,1),node_aux=aux,context=context)
         if self.online_trigger is not None:
