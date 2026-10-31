@@ -30,7 +30,8 @@ BOOTSTRAP_SEMANTICS = 'online_post_trigger_next_decision_v1'
 SUPPORTS_ONLINE_TRIGGER_RESUME = True
 SUPPORTS_ROLLOUT_PROVIDER_RESUME = False  # Pure-rollout online search is not in phase one.
 _IGNORED_CONFIG = {'updates','output_dir','checkpoints_dir','resume','device',
-                   'save_step_csv','checkpoint_interval','init_checkpoint'}
+                   'save_step_csv','checkpoint_interval','init_checkpoint',
+                   'latest_checkpoint_interval'}
 
 def _count(name, value):
     if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
