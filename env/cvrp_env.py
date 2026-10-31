@@ -1,7 +1,7 @@
 """Dynamic grid-based CVRP environment with reproducible traffic and demand revelation."""
+
 from __future__ import annotations
 
-import copy
 import random
 from typing import Any, Dict, Optional
 import warnings
@@ -10,8 +10,10 @@ import torch
 from torch_geometric.data import Data
 from .traffic import generate_traffic_matrix
 
+
 class CVRPGridEnv:
-    build_state_on_reset = True 
+    build_state_on_reset = True
+
     def __init__(
         self,
         grid_size: int = 15,
@@ -123,10 +125,15 @@ class CVRPGridEnv:
 
     def _generate_traffic_matrix(self) -> np.ndarray:
         self.current_traffic_matrix = generate_traffic_matrix(
-            self.current_traffic_matrix, self.baseline_distance_matrix,
-            beta=self.traffic_transition_beta, noise_std=self.traffic_noise_std,
-            trend=self.traffic_trend, generator=self._torch_generator,
-            mode=self.traffic_trend_mode, ratio=self.traffic_trend_ratio)
+            self.current_traffic_matrix,
+            self.baseline_distance_matrix,
+            beta=self.traffic_transition_beta,
+            noise_std=self.traffic_noise_std,
+            trend=self.traffic_trend,
+            generator=self._torch_generator,
+            mode=self.traffic_trend_mode,
+            ratio=self.traffic_trend_ratio,
+        )
         self.time_step += 1
         return self.current_traffic_matrix
 
@@ -149,14 +156,16 @@ class CVRPGridEnv:
             expected = float(self.expected_demands.get(node, 0))
             actual = self.actual_demands.get(node)
             observed = float(actual) if actual is not None else expected
-            features.append([
-                observed,
-                expected,
-                float(node in self.visited),
-                float(node == self.current_node),
-                float(self.vehicle_load),
-                float(self.distance_matrix[self.current_node, node]),
-            ])
+            features.append(
+                [
+                    observed,
+                    expected,
+                    float(node in self.visited),
+                    float(node == self.current_node),
+                    float(self.vehicle_load),
+                    float(self.distance_matrix[self.current_node, node]),
+                ]
+            )
         src, dst = self.edge_index
         edge_attr = torch.as_tensor(
             self.distance_matrix[src.detach().cpu().numpy(), dst.detach().cpu().numpy()],
@@ -173,7 +182,9 @@ class CVRPGridEnv:
         warnings.warn(
             "CVRPGridEnv.step is a legacy single-instance path (unnormalised features and rewards, "
             "no failure penalty); train and evaluate with BatchCVRPEnv.",
-            FutureWarning, stacklevel=2)
+            FutureWarning,
+            stacklevel=2,
+        )
         if not isinstance(action, (int, np.integer)):
             raise TypeError("action must be an integer node index.")
         action = int(action)
@@ -199,14 +210,21 @@ class CVRPGridEnv:
 
     def save_state(self) -> Dict[str, Any]:
         return {
-            "nodes": self.nodes[:], "customer_nodes": self.customer_nodes[:],
-            "expected_demands": self.expected_demands.copy(), "actual_demands": self.actual_demands.copy(),
-            "visited": self.visited.copy(), "vehicle_load": self.vehicle_load,
-            "current_node": self.current_node, "total_cost": self.total_cost,
-            "step_count": self.step_count, "time_step": self.time_step,
+            "nodes": self.nodes[:],
+            "customer_nodes": self.customer_nodes[:],
+            "expected_demands": self.expected_demands.copy(),
+            "actual_demands": self.actual_demands.copy(),
+            "visited": self.visited.copy(),
+            "vehicle_load": self.vehicle_load,
+            "current_node": self.current_node,
+            "total_cost": self.total_cost,
+            "step_count": self.step_count,
+            "time_step": self.time_step,
             "current_traffic_matrix": self.current_traffic_matrix.copy(),
-            "distance_matrix": self.distance_matrix.copy(), "rng_state": self.rng.getstate(),
-            "np_rng_state": self.np_rng.get_state(), "torch_rng_state": self._torch_generator.get_state().clone(),
+            "distance_matrix": self.distance_matrix.copy(),
+            "rng_state": self.rng.getstate(),
+            "np_rng_state": self.np_rng.get_state(),
+            "torch_rng_state": self._torch_generator.get_state().clone(),
         }
 
     def load_state(self, state: Dict[str, Any]) -> None:
@@ -229,17 +247,35 @@ class CVRPGridEnv:
 
 
 class CVRPGridEnvForLatent(CVRPGridEnv):
-    def __init__(self, grid_size: int = 12, vehicle_capacity: int = 15, num_customers: int = 100,
-                 seed: Optional[int] = None, device: str | torch.device | None = None,
-                 demand_noise_std: float = 1.0, traffic_noise_std: float = 1.0,
-                 traffic_trend: float = 5.0, traffic_beta: float = 0.07, max_steps: Optional[int] = None,
-                 traffic_trend_mode: str = "additive", traffic_trend_ratio: float = 0.3):
+    def __init__(
+        self,
+        grid_size: int = 12,
+        vehicle_capacity: int = 15,
+        num_customers: int = 100,
+        seed: Optional[int] = None,
+        device: str | torch.device | None = None,
+        demand_noise_std: float = 1.0,
+        traffic_noise_std: float = 1.0,
+        traffic_trend: float = 5.0,
+        traffic_beta: float = 0.07,
+        max_steps: Optional[int] = None,
+        traffic_trend_mode: str = "additive",
+        traffic_trend_ratio: float = 0.3,
+    ):
         super().__init__(
-            grid_size=grid_size, vehicle_capacity=vehicle_capacity, num_customers=num_customers,
-            seed=seed, device=device, demand_noise_std=demand_noise_std,
-            traffic_transition_beta=traffic_beta, traffic_noise_std=traffic_noise_std,
-            traffic_trend=traffic_trend, use_knn_graph=True,
-            traffic_trend_mode=traffic_trend_mode, traffic_trend_ratio=traffic_trend_ratio,
-            k_neighbors=min(40, max(1, num_customers // 5)), traffic_update_interval=5,
+            grid_size=grid_size,
+            vehicle_capacity=vehicle_capacity,
+            num_customers=num_customers,
+            seed=seed,
+            device=device,
+            demand_noise_std=demand_noise_std,
+            traffic_transition_beta=traffic_beta,
+            traffic_noise_std=traffic_noise_std,
+            traffic_trend=traffic_trend,
+            use_knn_graph=True,
+            traffic_trend_mode=traffic_trend_mode,
+            traffic_trend_ratio=traffic_trend_ratio,
+            k_neighbors=min(40, max(1, num_customers // 5)),
+            traffic_update_interval=5,
             max_steps=max_steps,
         )
