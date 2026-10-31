@@ -84,7 +84,8 @@ class HybridSearchConfig:
             "scale_decay",
             "scale_floor",
             "min_gain",
-            "budget_seconds" "min_gain_ratio",
+            "budget_seconds",
+            "min_gain_ratio",
             "lcb_lambda",
         )
         for key in keys:
