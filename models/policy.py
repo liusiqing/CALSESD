@@ -18,6 +18,7 @@ ordinary no_grad inference. Dynamic features, auxiliary state, attention and
 legality masks are always recomputed. It returns logits so a training program can use the exact same
 masked distribution for sampling and log-probability calculations.
 """
+
 from __future__ import annotations
 
 import math
@@ -119,8 +120,7 @@ class GeometryDynamicPointerPolicy(nn.Module):
         )
         self.static_norm = nn.LayerNorm(hidden_dim)
 
-        self.auxiliary_encoder = nn.Sequential(
-            nn.Linear(5, dynamic_dim), nn.GELU(), nn.LayerNorm(dynamic_dim))
+        self.auxiliary_encoder = nn.Sequential(nn.Linear(5, dynamic_dim), nn.GELU(), nn.LayerNorm(dynamic_dim))
         self.dynamic_encoder = nn.Sequential(
             nn.Linear(dynamic_input_dim, hidden_dim),
             nn.GELU(),
@@ -156,8 +156,7 @@ class GeometryDynamicPointerPolicy(nn.Module):
         )
 
     @staticmethod
-    def sample_prior(batch_size: int, latent_dim: int, device: torch.device | str,
-                     bound: float = 1.0) -> Tensor:
+    def sample_prior(batch_size: int, latent_dim: int, device: torch.device | str, bound: float = 1.0) -> Tensor:
         """Samples one external latent vector per parallel rollout."""
         if batch_size < 1:
             raise ValueError("batch_size must be positive.")
@@ -195,7 +194,7 @@ class GeometryDynamicPointerPolicy(nn.Module):
         batch = self._validate_batch(geometry_data)
         if geometry_data.x.size(-1) < self.geometry_input_dim:
             raise ValueError("geometry_data.x has fewer columns than geometry_input_dim.")
-        x = geometry_data.x[:, :self.geometry_input_dim].float()
+        x = geometry_data.x[:, : self.geometry_input_dim].float()
         x = self.geometry_projection(x)
         edge_attr = self._geometry_edge_attr(geometry_data)
         for layer in self.static_gats:
@@ -210,12 +209,15 @@ class GeometryDynamicPointerPolicy(nn.Module):
         fusion_signature = None
         if self._can_cache_static_fusion(encoded):
             layer = self.node_fusion[0]
-            fusion_static = F.linear(encoded, layer.weight[:, :self.hidden_dim], layer.bias)
+            fusion_static = F.linear(encoded, layer.weight[:, : self.hidden_dim], layer.bias)
             fusion_signature = self._fusion_signature(encoded)
         return StaticGeometry(
-            node_embeddings=encoded, padding_mask=padding_mask,
-            batch=batch.detach().clone(), graph_summary=graph_summary,
-            fusion_static=fusion_static, fusion_signature=fusion_signature,
+            node_embeddings=encoded,
+            padding_mask=padding_mask,
+            batch=batch.detach().clone(),
+            graph_summary=graph_summary,
+            fusion_static=fusion_static,
+            fusion_signature=fusion_signature,
         )
 
     @staticmethod
@@ -230,19 +232,29 @@ class GeometryDynamicPointerPolicy(nn.Module):
 
     def _can_cache_static_fusion(self, static: Tensor) -> bool:
         # Backward always uses the original complete fusion layer.
-        return (self.cache_static_fusion and not torch.is_grad_enabled()
-                and not torch.is_inference_mode_enabled()
-                and not self._autocast_active(static.device.type))
+        return (
+            self.cache_static_fusion
+            and not torch.is_grad_enabled()
+            and not torch.is_inference_mode_enabled()
+            and not self._autocast_active(static.device.type)
+        )
 
     def _fusion_signature(self, static: Tensor) -> tuple:
         layer = self.node_fusion[0]
-        return (id(layer.weight), layer.weight._version,
-                id(layer.bias), layer.bias._version if layer.bias is not None else None,
-                layer.weight.device, layer.weight.dtype,
-                id(static), static._version, static.device, static.dtype)
+        return (
+            id(layer.weight),
+            layer.weight._version,
+            id(layer.bias),
+            layer.bias._version if layer.bias is not None else None,
+            layer.weight.device,
+            layer.weight.dtype,
+            id(static),
+            static._version,
+            static.device,
+            static.dtype,
+        )
 
-    def _fuse_nodes(self, static: Tensor, dynamic: Tensor,
-                    geometry: StaticGeometry) -> Tensor:
+    def _fuse_nodes(self, static: Tensor, dynamic: Tensor, geometry: StaticGeometry) -> Tensor:
         """Same affine map; optionally reuse its geometry-only term.
 
         Linear([static,dynamic]) = W_s*static + bias + W_d*dynamic.
@@ -250,10 +262,13 @@ class GeometryDynamicPointerPolicy(nn.Module):
         of floating-point operations differs slightly from the original path.
         """
         cached = geometry.fusion_static
-        if (cached is not None and self._can_cache_static_fusion(static)
-                and geometry.fusion_signature == self._fusion_signature(static)):
+        if (
+            cached is not None
+            and self._can_cache_static_fusion(static)
+            and geometry.fusion_signature == self._fusion_signature(static)
+        ):
             layer = self.node_fusion[0]
-            dynamic_term = F.linear(dynamic, layer.weight[:, self.hidden_dim:], None)
+            dynamic_term = F.linear(dynamic, layer.weight[:, self.hidden_dim :], None)
             fused = cached + dynamic_term
             return self.node_fusion[2](self.node_fusion[1](fused))
         return self.node_fusion(torch.cat((static, dynamic), dim=-1))
@@ -291,16 +306,16 @@ class GeometryDynamicPointerPolicy(nn.Module):
             raise ValueError("Geometry and dynamic state must have identical batch layout and node order.")
         return dense, mask
 
-    def forward(self, dynamic_data: Data, geometry: StaticGeometry, z: Tensor,
-                action_mask: Optional[Tensor] = None) -> Tensor:
+    def forward(
+        self, dynamic_data: Data, geometry: StaticGeometry, z: Tensor, action_mask: Optional[Tensor] = None
+    ) -> Tensor:
         """Return masked next-node logits with shape ``[B, max_nodes]``.
 
         ``action_mask`` is True for legal actions. Its shape must match the
         output dense-node layout. Padding is always made illegal.
         """
         static = geometry.node_embeddings
-        if (geometry.batch.shape != dynamic_data.batch.shape
-                or not torch.equal(geometry.batch, dynamic_data.batch)):
+        if geometry.batch.shape != dynamic_data.batch.shape or not torch.equal(geometry.batch, dynamic_data.batch):
             raise ValueError("Cached geometry batch layout changed; rebuild geometry after reset.")
         dynamic, mask = self._dynamic_dense(dynamic_data, geometry.padding_mask)
         if static.shape[:2] != dynamic.shape[:2]:
@@ -320,10 +335,9 @@ class GeometryDynamicPointerPolicy(nn.Module):
         if not torch.equal(current_mask, mask):
             raise ValueError("Current-node feature layout does not match graph layout.")
         current_weights = current_dense * mask.to(current_dense.dtype)
-        fallback = mask.to(current_dense.dtype)
         if not torch.is_grad_enabled() and bool((current_weights.sum(dim=1) <= 0).any()):
             raise ValueError("state has no current-node flag in x[:, 3]")
-           
+
         current_weights = current_weights / current_weights.sum(dim=1, keepdim=True).clamp_min(1.0)
         current_embedding = (node_embeddings * current_weights.unsqueeze(-1)).sum(dim=1)
 
@@ -340,7 +354,7 @@ class GeometryDynamicPointerPolicy(nn.Module):
         logits = (self.pointer_query(context).unsqueeze(1) * self.pointer_key(node_embeddings)).sum(-1)
         logits = logits / math.sqrt(self.hidden_dim)
         logits = self.pointer_clip * torch.tanh(logits + self.node_bias(dynamic).squeeze(-1))
-                   
+
         legal = mask.clone()
         if action_mask is not None:
             action_mask = torch.as_tensor(action_mask, dtype=torch.bool, device=logits.device)
@@ -352,12 +366,19 @@ class GeometryDynamicPointerPolicy(nn.Module):
             raise ValueError("No legal action; masks must include done-row depot")
         return logits.masked_fill(~legal, torch.finfo(logits.dtype).min)
 
-    def distribution(self, dynamic_data: Data, geometry: StaticGeometry, z: Tensor,
-                     action_mask: Optional[Tensor] = None) -> Categorical:
+    def distribution(
+        self, dynamic_data: Data, geometry: StaticGeometry, z: Tensor, action_mask: Optional[Tensor] = None
+    ) -> Categorical:
         return Categorical(logits=self.forward(dynamic_data, geometry, z, action_mask))
 
-    def act(self, dynamic_data: Data, geometry: StaticGeometry, z: Tensor,
-            action_mask: Optional[Tensor] = None, deterministic: bool = False):
+    def act(
+        self,
+        dynamic_data: Data,
+        geometry: StaticGeometry,
+        z: Tensor,
+        action_mask: Optional[Tensor] = None,
+        deterministic: bool = False,
+    ):
         """Return ``action, log_prob, entropy, logits`` for one rollout step."""
         logits = self.forward(dynamic_data, geometry, z, action_mask)
         dist = Categorical(logits=logits)
@@ -365,8 +386,9 @@ class GeometryDynamicPointerPolicy(nn.Module):
         return action, dist.log_prob(action), dist.entropy(), logits
 
 
-def build_geometry_data(dynamic_data: Data, baseline_distance_matrix, coords: Optional[Tensor] = None,
-                        coordinate_dim: int = 2) -> Data:
+def build_geometry_data(
+    dynamic_data: Data, baseline_distance_matrix, coords: Optional[Tensor] = None, coordinate_dim: int = 2
+) -> Data:
     """Build a static PyG graph in the exact batch order of ``dynamic_data``.
 
     Preferred usage passes actual normalized coordinates via ``coords``.
