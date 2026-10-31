@@ -84,6 +84,8 @@ class CVRPEuclideanEnv(CVRPGridEnv):
         return torch.stack((src.reshape(-1), indices.reshape(-1)), dim=0).long().contiguous()
 
     def reset(self, num_customers=None):
+        if num_customers is not None and int(num_customers) != self.num_nodes - 1:
+            raise ValueError("CVRPEuclideanEnv has a fixed instance; num_customers cannot be changed")
         self.nodes = list(range(self.num_nodes))
         self.customer_nodes = list(range(1, self.num_nodes))
         self.num_customers = len(self.customer_nodes)
