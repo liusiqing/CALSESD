@@ -194,7 +194,7 @@ def _validate_episode(
         timing = InferenceTiming(device)
     with timing.measure('actor_geometry'):
         geometry = policy.encode_geometry(build_geometry_data(
-            state, env.env.baseline_distance_matrix, coords=env.env.coords
+            state, env.env.baseline_distance_matrix,coords=env.env.coords / max(1.0, float(env.env.grid_size))
         ))
     coords = torch.as_tensor(env.env.coords, dtype=torch.float32, device=device)
     matrix = torch.cdist(coords, coords, p=2)
@@ -247,7 +247,7 @@ def _validate_episode(
         if bool((active & ~mask.gather(1, action[:, None]).squeeze(1)).any()):
             raise ValueError('validation selected an illegal action')
         distance += torch.where(active, matrix[env.current_nodes, action], 0.)
-        state, _, _ = env.step(action)
+        state, _, _ = env.step(action, action_mask=mask)
     if not bool(env.dones.all()) or trigger.pending:
         raise RuntimeError('validation did not finish full finite episodes with a closed trigger')
     metrics = _episode_metrics(cfg, env, distance, seed, update, episode_writer)
