@@ -17,8 +17,8 @@ import math
 
 import torch
 
-from CALSESD_internal.models import build_geometry_data
-from CALSESD_internal.models.hybrid_latent_search import HybridLatentSearch
+from CALSESD.models import build_geometry_data
+from CALSESD.models.hybrid_latent_search import HybridLatentSearch
 from .ablation_config import resolve_ablation, build_search_config
 from .env_factory import make_env
 from .online_trigger import OnlineTrigger, OnlineTriggerConfig
