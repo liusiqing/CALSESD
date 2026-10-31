@@ -4,7 +4,7 @@ from __future__ import annotations
 import copy
 import random
 from typing import Any, Dict, Optional
-
+import warnings
 import numpy as np
 import torch
 from torch_geometric.data import Data
@@ -170,6 +170,10 @@ class CVRPGridEnv:
         )
 
     def step(self, action: int):
+        warnings.warn(
+            "CVRPGridEnv.step is a legacy single-instance path (unnormalised features and rewards, "
+            "no failure penalty); train and evaluate with BatchCVRPEnv.",
+            FutureWarning, stacklevel=2)
         if not isinstance(action, (int, np.integer)):
             raise TypeError("action must be an integer node index.")
         action = int(action)
