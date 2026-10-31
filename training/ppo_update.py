@@ -161,10 +161,11 @@ def _validate_online_rollout(cfg,critic,r):
         if not torch.equal(next_values[:-1][continuing],values[1:][continuing]):
             raise ValueError('bootstrap does not use the actual next post-trigger decision value')
     if cfg.gae_keep_bootstrap:
-        if len(r.keep_values)!=T:raise ValueError('rollout lacks keep_values; recollect with the keep-bootstrap collector')
+        if len(r.keep_values)!=T:
+            raise ValueError('rollout lacks keep_values; recollect with the keep-bootstrap collector')
     keep=torch.stack(r.keep_values)
         if (keep.shape!=valid.shape or keep.device!=valid.device or not keep.is_floating_point()
-                or keep.requires_grad or not bool(torch.isfinite(keep[valid]).all())):
+            or keep.requires_grad or not bool(torch.isfinite(keep[valid]).all())):
             raise ValueError('invalid keep_values')
         same=valid&~switched
         if not torch.equal(keep[same],values[same]):
