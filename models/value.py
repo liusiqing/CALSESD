@@ -21,7 +21,7 @@ ONLINE_VALUE_SEMANTICS = 'online_actor_controller_v1'
 
 class ValueNetwork(nn.Module):
     def __init__(self, hidden_dim=128, dynamic_dim=64, latent_dim=16,
-                 n_critics=4, kind="hybrid"):
+                 n_critics=4, kind="hybrid", prior_scale=0.0):
         super().__init__()
         if n_critics < 2 or kind != "hybrid":
             raise ValueError("invalid value configuration")
@@ -38,6 +38,16 @@ class ValueNetwork(nn.Module):
         self.heads = nn.ModuleList([nn.Sequential(
             nn.Linear(self.state_feature_dim+latent_dim,H),nn.GELU(),nn.Linear(H,H),nn.GELU(),nn.Linear(H,1))
             for _ in range(n_critics)])
+        self.prior_scale = float(prior_scale)
+        if self.prior_scale < 0:
+            raise ValueError('prior_scale must be non-negative')
+        if self.prior_scale > 0:   # 冻结的随机先验:数据之外各 head 的差异被放大
+            in_dim = self.state_feature_dim + latent_dim
+            self.priors = nn.ModuleList([nn.Sequential(
+                nn.Linear(in_dim, H // 2), nn.GELU(), nn.Linear(H // 2, 1))
+                for _ in range(n_critics)])
+            for p in self.priors.parameters():
+                p.requires_grad_(False)
         # Ordinary attributes: never serialized in state_dict, never shared with Actor.
         self.cache_static = True
         self.static_cache_size = 4
@@ -176,7 +186,7 @@ class ValueNetwork(nn.Module):
         context=state.context[:, :2].to(dense)
         online=online.to(dense)
         counts=valid.sum(1).clamp_min(1).to(dense.dtype)
-        extra=torch.stack((remaining.sum(1)/counts,(x[:,:,0]*remaining).sum(1)), -1)
+        extra=torch.stack((remaining.sum(1)/counts,torch.log1p((x[:,:,0]*remaining).sum(1))), -1)
         return torch.cat((self.pool(dense,valid),self.pool(dense,remaining),
             self.pool(dense,current),self.pool(dense,depot),context,online,extra),-1)
 
@@ -189,8 +199,10 @@ class ValueNetwork(nn.Module):
         if z.size(0)==1:z=z.expand(features.size(0),-1)
         if z.size(0)!=features.size(0):raise ValueError("latent batch mismatch")
         inp=torch.cat((features,z.to(features)), -1)
-        return torch.stack([h(inp).squeeze(-1) for h in self.heads],0)
-
+        out=torch.stack([h(inp).squeeze(-1) for h in self.heads],0)
+        if self.prior_scale > 0:
+            out=out+self.prior_scale*torch.stack([p(inp).squeeze(-1) for p in self.priors],0)
+        return out
     def all_values(self,policy,state,geometry,z):
         return self.evaluate_features(self.encode_state(state),z)
 
