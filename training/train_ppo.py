@@ -249,7 +249,7 @@ def main():
         dynamic_dim=cfg.dynamic_dim,latent_dim=cfg.latent_dim,num_heads=cfg.num_heads,
         static_gat_layers=cfg.static_gat_layers,static_transformer_layers=cfg.static_transformer_layers,
         dropout=cfg.dropout).to(device)
-    critic=ValueNetwork(hidden_dim=cfg.hidden_dim,latent_dim=cfg.latent_dim,n_critics=cfg.n_critics).to(device)
+     critic=ValueNetwork(hidden_dim=cfg.hidden_dim,latent_dim=cfg.latent_dim,n_critics=cfg.n_critics,prior_scale=cfg.critic_prior_scale).to(device)
     _configure_networks(cfg,actor,critic)
     actor_opt=torch.optim.Adam(actor.parameters(),lr=cfg.learning_rate)
     critic_opt=torch.optim.Adam(critic.parameters(),lr=cfg.value_learning_rate)
@@ -321,7 +321,8 @@ def main():
                 with timer.phase('checkpoint'):
                     if validation is not None and key>best:
                         best=key;checkpoint_io.save_checkpoint(ckpt_dir/'checkpoint_best.pt',cfg,models,optimizers,update,best,r,collector,history)
-                    checkpoint_io.save_checkpoint(ckpt_dir/'checkpoint_latest.pt',cfg,models,optimizers,update,best,r,collector,history)
+                    if update%cfg.latest_checkpoint_interval==0 or update==cfg.updates:
+                        checkpoint_io.save_checkpoint(ckpt_dir/'checkpoint_latest.pt',cfg,models,optimizers,update,best,r,collector,history)
                     if update%cfg.checkpoint_interval==0:
                         checkpoint_io.save_checkpoint(ckpt_dir/f'checkpoint_update_{update:05d}.pt',cfg,models,optimizers,update,best,r,collector,history)
                 row=logging_io.build_training_row(update=update,global_step=collector.global_step,batch_size=cfg.batch_size,
