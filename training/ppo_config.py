@@ -34,6 +34,8 @@ class PPOConfig:
     traffic_noise_std: float = 1.0
     traffic_trend: float = 5.0
     traffic_beta: float = 0.07
+    traffic_trend_mode: str = 'relative'
+    traffic_trend_ratio: float = 0.3
     vary_instance_seed: bool = True
     bootstrap_time_limits: bool = False
 
@@ -63,6 +65,7 @@ class PPOConfig:
     static_transformer_layers: int = 2
     dropout: float = 0.0
     n_critics: int = 4
+    critic_prior_scale: float = 0.5   # 随机先验网络强度
     latent_bound: float = 1.0
     z_resample_prob: float = 0.5         # 每个 episode 开始时按行重采样 z 的概率
     actor_cache_static_fusion: bool = True
@@ -73,11 +76,11 @@ class PPOConfig:
     search_scope: str = 'episode'
     mode: str = 'evolution'  # keep disables search; none/default is not keep.
     search_warmup_updates: int = 10
-    online_search_interval: int = 20
+    online_search_interval: int = 30
     online_cooldown_steps: int = 5  # Attempt-based; interval is the stronger guard.
     online_max_attempts_per_episode: int = 3
-    online_search_budget_seconds: float = 1.0  # 0: no per-call time limit.
-    online_batch_budget_seconds: float = 3.0  # 0: no full-batch time limit.
+    online_search_budget_seconds: float = 0.0  # 0: no per-call time limit.
+    online_batch_budget_seconds: float = 0.0  # 0: no full-batch time limit.
     online_min_remaining_customers: int = 2
 
     # Shared latent population search.
@@ -85,6 +88,7 @@ class PPOConfig:
     evolution_generations: int = 3
     gradient_steps: int = 1  # exp1 requires 1; its none variant applies 0 steps.
     gradient_lr: float = 0.05
+    latent_gradient_normalize: bool = True  # 步长 = lr * 单位方向,与批大小和 Critic 尺度无关
     uncertainty_kappa: float = 1.0
     reopt_min_gain: float = 0.0
     reopt_min_gain_ratio: float = 1.0    # 接受阈值 = min_gain + ratio * 不确定性尺度
@@ -116,6 +120,7 @@ class PPOConfig:
 
     # Logging/checkpoints.
     checkpoint_interval: int = 25
+    latest_checkpoint_interval: int = 5
     save_step_csv: bool = False
 
 
@@ -132,7 +137,8 @@ _HIDDEN_FIELDS = {
     'mutation_sigma_max', 'max_gradient_norm', 'crossover_alpha_min',
     'crossover_alpha_max', 'validation_seed', 'checkpoint_interval',
     'save_step_csv', 'ablation_record_diagnostics','reward_scale', 'gae_keep_bootstrap', 'z_resample_prob',
-    'reopt_min_gain_ratio', 'lcb_lambda',
+    'reopt_min_gain_ratio', 'lcb_lambda','traffic_trend_mode', 'traffic_trend_ratio', 'critic_prior_scale',
+    'latent_gradient_normalize', 'latest_checkpoint_interval',
 }
 
 
@@ -210,7 +216,7 @@ def validate_config(cfg):
         'num_heads', 'static_transformer_layers', 'n_critics', 'critic_static_cache_size',
         'online_search_interval', 'online_max_attempts_per_episode', 'reopt_candidates',
         'evolution_generations', 'validation_interval', 'validation_seeds',
-        'checkpoint_interval',
+        'checkpoint_interval', 'latest_checkpoint_interval',
     )
     if any(getattr(cfg, name) < 1 for name in positive):
         raise ValueError('训练、网络、搜索计数必须为正整数')
@@ -247,6 +253,7 @@ def validate_config(cfg):
         'value_coef', 'entropy_coef', 'demand_noise_std', 'traffic_noise_std',
         'gradient_lr', 'uncertainty_kappa', 'reopt_min_gain',
         'reopt_min_gain_ratio', 'lcb_lambda',
+        'traffic_trend_ratio', 'critic_prior_scale',
     )
     if not 0.0 <= cfg.z_resample_prob <= 1.0:
         raise ValueError('z_resample_prob必须在[0,1]内')
@@ -263,6 +270,8 @@ def validate_config(cfg):
 
     if cfg.ablation_family == 'exp2':
         raise ValueError('阶段一暂不接入纯rollout搜索')
+    if cfg.traffic_trend_mode not in ('additive', 'relative'):
+        raise ValueError('traffic_trend_mode只支持additive/relative')
     supported = {
         'none': ('default',),
         'exp1': ('none', 'value_gradient', 'random_matched'),
