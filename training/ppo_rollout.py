@@ -6,7 +6,7 @@ bootstrap is filled from the NEXT actual post-trigger decision value.
 Only finite full episodes are supported; no Critic bootstrap at task cutoff.
 """
 from __future__ import annotations
-from copy import deepcopy
+from copy import copy, deepcopy
 from dataclasses import dataclass,field,asdict
 import math
 from numbers import Integral
@@ -227,7 +227,7 @@ class ActorOnlyCollector:
             self.z=self.policy.sample_prior(c.batch_size,c.latent_dim,e.device,c.latent_bound).detach().clone()
         self._validate_z(self.z)
         self._resample_latents(update)
-        geometry_input=build_geometry_data(state,e.env.baseline_distance_matrix,coords=e.env.coords).clone().detach()
+        geometry_input=build_geometry_data(state,e.env.baseline_distance_matrix,coords=e.env.coords/max(1.,float(e.env.grid_size))).clone().detach()
         with torch.no_grad():
             with self.inference_timing.measure('actor_geometry'):geometry=self.policy.encode_geometry(geometry_input)
             coords=torch.as_tensor(e.env.coords,dtype=torch.float32,device=e.device)
@@ -260,9 +260,9 @@ class ActorOnlyCollector:
                     mask=e.action_mask();logits=self.policy(state,geometry,z,mask)
                     distribution=torch.distributions.Categorical(logits=logits)
                     action=distribution.sample();logp=distribution.log_prob(action)
-            snapshot=state.clone().detach()
+            snapshot=copy(state)
             distance+=torch.where(active,geometric_matrix[e.current_nodes,action],0.)
-            next_state,reward,_=e.step(action)
+            next_state,reward,_=e.step(action,action_mask=mask)   # 不再重复计算 mask
             done=e.dones.clone();terminated=e.terminated.clone()
             if t+1==c.max_episode_steps and bool((active & ~done).any()):
                 raise RuntimeError('environment must apply its real finite-task cutoff/reward; no artificial truncation')
