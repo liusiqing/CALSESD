@@ -42,6 +42,7 @@ class HybridSearchConfig:
     min_gain:float=.1
     min_gain_ratio:float=0.
     lcb_lambda:float=0.
+    normalize_gradient:bool=False
     budget_seconds:float=1.
     seed:int=42
     refinement_mode:str='value_gradient'
@@ -57,7 +58,7 @@ class HybridSearchConfig:
         for key in ('seed','gradient_steps'):
             value=getattr(self,key)
             if isinstance(value,bool) or not isinstance(value,Integral) or value<0:raise ValueError(f'invalid {key}')
-        for key in ('adaptive_gradient_trust','adaptive_mutation','record_refinement_diagnostics'):
+        for key in ('adaptive_gradient_trust','adaptive_mutation','record_refinement_diagnostics','normalize_gradient'):
             if not isinstance(getattr(self,key),bool):raise ValueError(f'invalid {key}')
         keys=('latent_bound','elite_fraction','immigrant_fraction','crossover_alpha_min','crossover_alpha_max',
               'gradient_lr','max_gradient_norm','mutation_sigma_base','mutation_sigma_min','mutation_sigma_max',
@@ -220,7 +221,8 @@ class HybridLatentSearch:
             norm=gradient.norm(dim=-1,keepdim=True)
             if not bool(torch.isfinite(norm).all()):raise ValueError('gradient overflow')
             _,trust,_=self._controls(heads.detach().std(0,unbiased=False)[joint_due].mean(0),scale)
-            clipped=gradient*(c.max_gradient_norm/norm.clamp_min(1e-12)).clamp(max=1.)
+            clipped=(gradient/norm.clamp_min(1e-12) if c.normalize_gradient
+                     else gradient*(c.max_gradient_norm/norm.clamp_min(1e-12)).clamp(max=1.))
             reference=c.gradient_lr*trust[:,None]*clipped
             if c.refinement_mode=='value_gradient':delta=reference;self.last_diagnostics['gradient_applied_steps']+=1
             else:
