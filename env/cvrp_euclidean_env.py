@@ -27,6 +27,7 @@ class CVRPEuclideanEnv(CVRPGridEnv):
                  device: str | torch.device | None = None, demand_noise_std: float = 1.0,
                  traffic_transition_beta: float = 0.07, traffic_noise_std: float = 1.0,
                  traffic_trend: float = 5.0, use_knn_graph: bool = False,
+                 traffic_trend_mode: str = "additive", traffic_trend_ratio: float = 0.3,
                  k_neighbors: Optional[int] = None, demand_mode: str = "uchoa",
                  synth_demand_lo: int = 1, synth_demand_hi: int = 5,
                  synth_capacity: int = 15, max_steps: Optional[int] = None):
@@ -59,6 +60,7 @@ class CVRPEuclideanEnv(CVRPGridEnv):
             seed=seed, device=device, demand_noise_std=(0.0 if demand_mode == "uchoa" else demand_noise_std),
             traffic_transition_beta=traffic_transition_beta, traffic_noise_std=traffic_noise_std,
             traffic_trend=traffic_trend, use_knn_graph=use_knn_graph,
+            traffic_trend_mode=traffic_trend_mode, traffic_trend_ratio=traffic_trend_ratio,
             k_neighbors=(k_neighbors if k_neighbors is not None else min(40, max(1, (len(raw_coords) - 1) // 5))),
             max_steps=max_steps,
         )
@@ -103,7 +105,7 @@ class CVRPEuclideanEnv(CVRPGridEnv):
         self.time_step = 0
         self.current_traffic_matrix = self.baseline_distance_matrix.copy()
         self.distance_matrix = self._generate_traffic_matrix()
-        return self._get_state()
+        return self._get_state() if self.build_state_on_reset else None
 
     def _reveal_demand(self, node: int) -> int:
         if self.actual_demands[node] is None:
@@ -120,12 +122,14 @@ class CVRPEuclideanEnvForLatent(CVRPEuclideanEnv):
                  device: str | torch.device | None = None, demand_noise_std: float = 1.0,
                  traffic_noise_std: float = 1.0, traffic_trend: float = 5.0,
                  traffic_beta: float = 0.07, demand_mode: str = "uchoa",
-                 synth_capacity: int = 15, max_steps: Optional[int] = None):
+                 synth_capacity: int = 15, max_steps: Optional[int] = None
+                 traffic_trend_mode: str = "additive", traffic_trend_ratio: float = 0.3):
         super().__init__(
             coords=coords, demands=demands, capacity=capacity, depot_idx=depot_idx,
             norm_grid_size=norm_grid_size, seed=seed, device=device,
             demand_noise_std=demand_noise_std, traffic_transition_beta=traffic_beta,
             traffic_noise_std=traffic_noise_std, traffic_trend=traffic_trend,
+            traffic_trend_mode=traffic_trend_mode, traffic_trend_ratio=traffic_trend_ratio,
             use_knn_graph=True, k_neighbors=min(40, max(1, (len(coords) - 1) // 5)),
             demand_mode=demand_mode, synth_capacity=synth_capacity, max_steps=max_steps,
         )
