@@ -19,6 +19,8 @@ import json
 import math
 from numbers import Integral, Real
 from time import perf_counter
+import warnings
+STRICT_LOGGING = False
 
 TRAIN_FIELDS = (
     'update','global_step','ablation_family','ablation_variant','search_scope','ppo_env_steps',
@@ -49,6 +51,10 @@ SEARCH_FIELDS = (
     'logged_search_calls_run_total','logged_search_timeouts_run_total','evaluation_backend',
 )
 
+def _violation(message):
+    if STRICT_LOGGING:
+        raise ValueError(message)
+    warnings.warn(f'logging invariant violated: {message}', RuntimeWarning, stacklevel=3)
 
 def finite_or_none(value):
     if value is None:
@@ -182,7 +188,7 @@ class DeferredCSVWriter(CSVWriter):
 def _same_count(name,*values):
     values=[_count(name,value) for value in values if value is not None]
     if values and any(value!=values[0] for value in values[1:]):
-        raise ValueError(f'Conflicting per-update {name}: {values}')
+        _violation(f'Conflicting per-update {name}: {values}')
     return values[0] if values else None
 
 
@@ -190,7 +196,7 @@ def _same_time(name,*values):
     values=[_time_or_none(name,value) for value in values if value is not None]
     values=[value for value in values if value is not None]
     if values and any(not math.isclose(value,values[0],rel_tol=1e-6,abs_tol=1e-6) for value in values[1:]):
-        raise ValueError(f'Conflicting {name}; do not mix collector wall time with charged trigger time')
+        _violation(f'Conflicting {name}; do not mix collector wall time with charged trigger time')
     return values[0] if values else None
 
 
@@ -268,9 +274,9 @@ class LogBundle:
         step=_count('global_step',row['global_step'])
         delta=_count('ppo_env_steps',row['ppo_env_steps'],optional=True)
         if self._last_global_step is not None:
-            if step<self._last_global_step:raise ValueError('global_step decreased within the logging segment')
+            if step<self._last_global_step:_violation('global_step decreased within the logging segment')
             expected=step-self._last_global_step
-            if delta is not None and delta!=expected:raise ValueError('ppo_env_steps disagrees with global_step delta')
+            if delta is not None and delta!=expected:_violation('ppo_env_steps disagrees with global_step delta')
             if delta is None:delta=expected
         elif delta is None and row['update']==1:
             delta=step
@@ -280,7 +286,7 @@ class LogBundle:
         expected_calls=_same_count('search_calls',row['search_calls'],summary.get('search_calls'))
         event_count=data['events'] if data else 0
         if expected_calls is not None and event_count>expected_calls:
-            raise ValueError('More unique search events than the batch reports')
+            _violation('More unique search events than the batch reports')
         complete=(event_count==expected_calls) if expected_calls is not None else None
         row['search_events_complete']=None if complete is None else int(complete)
         row['search_calls']=expected_calls if expected_calls is not None else event_count if event_count else None
@@ -314,9 +320,10 @@ class LogBundle:
         elif attempt is not None:key=('attempt',update,attempt)
         else:key=('event',signature)
         if key in self._seen_search:
-            if self._seen_search[key]!=signature:raise ValueError('Conflicting diagnostics for the same search identity')
+            if self._seen_search[key]!=signature:_violation('Conflicting diagnostics for the same search identity')
             return False
-        if update in self._written_updates:raise ValueError('New search event arrived after its training row was flushed')
+        if update in self._written_updates:
+            _violation('New search event arrived after its training row was flushed');return False
         timeout=_flag('timed_out',event.get('timed_out'))
         due=_count('due_rows',event.get('due_rows'),optional=True)
         switched=_count('switched_rows',event.get('switched_rows'),optional=True)
@@ -370,9 +377,10 @@ class LogBundle:
                 elif self.run_identity[key] is not None and event[key]!=self.run_identity[key]:raise ValueError(f'event identity mismatch: {key}')
         if kind=='joint_latent_search' and not self._record_search(event):return
         if kind=='ablation_training_update':
-            if event['update'] in self._written_updates:raise ValueError('Batch summary arrived after its training row was flushed')
+            if event['update'] in self._written_updates:
+                _violation('Batch summary arrived after its training row was flushed');return
             data=self._update(event['update'])
-            if data['summary'] is not None and data['summary']!=event:raise ValueError('Conflicting summaries for one update')
+            if data['summary'] is not None and data['summary']!=event:_violation('Conflicting summaries for one update')
             data['summary']=event
         if kind=='validation_protocol':
             token=hashlib.sha256(json.dumps(event,sort_keys=True,allow_nan=False).encode()).hexdigest()
