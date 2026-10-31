@@ -321,11 +321,9 @@ class GeometryDynamicPointerPolicy(nn.Module):
             raise ValueError("Current-node feature layout does not match graph layout.")
         current_weights = current_dense * mask.to(current_dense.dtype)
         fallback = mask.to(current_dense.dtype)
-        current_weights = torch.where(
-            current_weights.sum(dim=1, keepdim=True) > 0,
-            current_weights,
-            fallback,
-        )
+        if not torch.is_grad_enabled() and bool((current_weights.sum(dim=1) <= 0).any()):
+            raise ValueError("state has no current-node flag in x[:, 3]")
+           
         current_weights = current_weights / current_weights.sum(dim=1, keepdim=True).clamp_min(1.0)
         current_embedding = (node_embeddings * current_weights.unsqueeze(-1)).sum(dim=1)
 
@@ -341,8 +339,8 @@ class GeometryDynamicPointerPolicy(nn.Module):
         context = self.query_norm(query + attended).squeeze(1)
         logits = (self.pointer_query(context).unsqueeze(1) * self.pointer_key(node_embeddings)).sum(-1)
         logits = logits / math.sqrt(self.hidden_dim)
-        logits = self.pointer_clip * torch.tanh(logits) + self.node_bias(dynamic).squeeze(-1)
-
+        logits = self.pointer_clip * torch.tanh(logits + self.node_bias(dynamic).squeeze(-1))
+                   
         legal = mask.clone()
         if action_mask is not None:
             action_mask = torch.as_tensor(action_mask, dtype=torch.bool, device=logits.device)
@@ -412,7 +410,7 @@ def build_geometry_data(dynamic_data: Data, baseline_distance_matrix, coords: Op
     src, dst = dynamic_data.edge_index
     local_src = torch.remainder(src, n)
     local_dst = torch.remainder(dst, n)
-    edge_attr = baseline[local_src, local_dst].unsqueeze(-1)
+    edge_attr = (baseline[local_src, local_dst] / baseline.max().clamp_min(1e-6)).unsqueeze(-1)
     return Data(
         x=base_coords.repeat(batch_size, 1),
         edge_index=dynamic_data.edge_index,
