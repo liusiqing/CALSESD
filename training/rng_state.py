@@ -1,8 +1,10 @@
 """保留全局训练随机数生成器"""
+
 from contextlib import contextmanager
 import random
 import numpy as np
 import torch
+
 
 @contextmanager
 def preserve_rng():
