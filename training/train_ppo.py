@@ -249,7 +249,12 @@ def main():
         dynamic_dim=cfg.dynamic_dim,latent_dim=cfg.latent_dim,num_heads=cfg.num_heads,
         static_gat_layers=cfg.static_gat_layers,static_transformer_layers=cfg.static_transformer_layers,
         dropout=cfg.dropout).to(device)
-     critic=ValueNetwork(hidden_dim=cfg.hidden_dim,latent_dim=cfg.latent_dim,n_critics=cfg.n_critics,prior_scale=cfg.critic_prior_scale).to(device)
+    critic = ValueNetwork(
+        hidden_dim=cfg.hidden_dim,
+        latent_dim=cfg.latent_dim,
+        n_critics=cfg.n_critics,
+        prior_scale=cfg.critic_prior_scale,
+    ).to(device)
     _configure_networks(cfg,actor,critic)
     actor_opt=torch.optim.Adam(actor.parameters(),lr=cfg.learning_rate)
     critic_opt=torch.optim.Adam(critic.parameters(),lr=cfg.value_learning_rate)
