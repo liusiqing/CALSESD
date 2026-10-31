@@ -74,10 +74,6 @@ class InferenceTiming:
         self.cpu_samples.clear()
 
         return {
-            "timing_kind": (
-                "cuda_stream_interval"
-                if self.device.type == "cuda"
-                else "cpu_wall"
-            ),
+            "timing_kind": ("cuda_stream_interval" if self.device.type == "cuda" else "cpu_wall"),
             "stages": result,
         }
