@@ -1,22 +1,10 @@
-"""Latent-conditioned pointer policy for BatchCVRPEnv-compatible PyG states.
+"""隐变量条件指针策略网络(精简版:已删除输入形状/类型检查,网络结构与参数名保持不变)。
 
-Architecture
-------------
-1. Geometry-static branch: obtains a reusable node embedding from immutable
-   coordinates / baseline-distance information supplied at reset time.
-2. Stepwise dynamic branch: encodes the six features emitted by BatchCVRPEnv:
-   observed demand, expected demand, visited, current-node flag, vehicle load,
-   and current traffic distance from the vehicle.
-3. Latent-conditioned pointer: forms a vehicle query from the current node,
-   graph summary, dynamic summary, and externally supplied latent z, then
-   scores each graph node as the next action.
-
-The model deliberately contains no optimiser, training loop, critic, or search
-procedure. It retains the original layers and state_dict keys. Geometry graph
-summaries are cached; the geometry-only part of node fusion may be reused during
-ordinary no_grad inference. Dynamic features, auxiliary state, attention and
-legality masks are always recomputed. It returns logits so a training program can use the exact same
-masked distribution for sampling and log-probability calculations.
+结构:
+1. 静态几何分支:由坐标和基准距离得到可复用的节点嵌入(reset 后编码一次)。
+2. 动态分支:编码 BatchCVRPEnv 输出的 6 维节点特征和辅助特征。
+3. 隐变量条件指针:图摘要 + 动态摘要 + 当前节点 + 隐变量 z 形成查询,对节点打分得到 logits。
+模型只返回 logits,采样与 log_prob 由训练代码用同一个 masked 分布计算。
 """
 
 from __future__ import annotations
@@ -34,15 +22,9 @@ from torch_geometric.nn import GATv2Conv
 from torch_geometric.utils import to_dense_batch
 
 
+# 核心模块:静态几何缓存,由调用方持有。几何、节点顺序、编码器参数或设备变化后需重建。
 @dataclass
 class StaticGeometry:
-    """Immutable per-instance geometry cache, owned by the caller.
-
-    Rebuild after geometry/node-order changes, encoder parameter updates, or
-    device/dtype changes. Do not mutate cached tensors in place.
-    The optional affine cache is only used during ordinary no_grad forwards.
-    """
-
     node_embeddings: Tensor
     padding_mask: Tensor
     batch: Tensor
@@ -52,17 +34,6 @@ class StaticGeometry:
 
 
 class GeometryDynamicPointerPolicy(nn.Module):
-    """Geometry-static encoder + dynamic encoder + latent-conditioned pointer.
-
-    Expected dynamic state is a PyG ``Data`` object emitted by ``BatchCVRPEnv``:
-    ``data.x`` has shape ``[B*N, 6]`` and ``data.batch`` identifies graph rows.
-    A geometry state must have the same node order and batch layout. Its
-    ``x`` may be either coordinates ``[B*N, 2]`` or a feature matrix containing
-    coordinates in the first two columns. If coordinates are unavailable,
-    ``build_geometry_data`` can construct a geometry state from a baseline
-    distance matrix using classical MDS.
-    """
-
     def __init__(
         self,
         dynamic_input_dim: int = 6,
@@ -77,21 +48,13 @@ class GeometryDynamicPointerPolicy(nn.Module):
         pointer_clip: float = 10.0,
     ) -> None:
         super().__init__()
-        if hidden_dim <= 0 or dynamic_dim <= 0 or latent_dim <= 0:
-            raise ValueError("hidden_dim, dynamic_dim, and latent_dim must be positive.")
-        if num_heads < 1 or hidden_dim % num_heads != 0:
-            raise ValueError("hidden_dim must be divisible by num_heads.")
-        if static_gat_layers < 0 or static_transformer_layers < 1:
-            raise ValueError("Layer counts must be non-negative.")
-
         self.dynamic_input_dim = dynamic_input_dim
         self.geometry_input_dim = geometry_input_dim
         self.hidden_dim = hidden_dim
         self.dynamic_dim = dynamic_dim
         self.latent_dim = latent_dim
         self.pointer_clip = float(pointer_clip)
-        # Plain runtime switch, no new parameters or checkpoint fields.
-        self.cache_static_fusion = True
+        self.cache_static_fusion = True  # 运行时开关,不产生新参数
 
         self.geometry_projection = nn.Sequential(
             nn.Linear(geometry_input_dim, hidden_dim),
@@ -157,45 +120,18 @@ class GeometryDynamicPointerPolicy(nn.Module):
 
     @staticmethod
     def sample_prior(batch_size: int, latent_dim: int, device: torch.device | str, bound: float = 1.0) -> Tensor:
-        """Samples one external latent vector per parallel rollout."""
-        if batch_size < 1:
-            raise ValueError("batch_size must be positive.")
+        """每个并行回合采样一个 [-bound, bound] 均匀分布的外部隐变量。"""
         return (2.0 * torch.rand(batch_size, latent_dim, device=device) - 1.0) * float(bound)
 
     @staticmethod
-    def _validate_batch(data: Data) -> Tensor:
-        if not hasattr(data, "x") or not hasattr(data, "batch"):
-            raise ValueError("data must provide PyG attributes x and batch.")
-        if data.x.ndim != 2 or data.batch.ndim != 1 or data.x.size(0) != data.batch.numel():
-            raise ValueError("data.x and data.batch have incompatible shapes.")
-        return data.batch
+    def _geometry_edge_attr(geometry_data: Data) -> Tensor:
+        return geometry_data.edge_attr[:, :1].float()
 
-    def _geometry_edge_attr(self, geometry_data: Data) -> Tensor:
-        edge_count = geometry_data.edge_index.size(1)
-        if hasattr(geometry_data, "edge_attr") and geometry_data.edge_attr is not None:
-            edge_attr = geometry_data.edge_attr
-            if edge_attr.ndim == 1:
-                edge_attr = edge_attr.unsqueeze(-1)
-            if edge_attr.size(0) == edge_count:
-                return edge_attr[:, :1].float()
-        return torch.ones((edge_count, 1), dtype=geometry_data.x.dtype, device=geometry_data.x.device)
-
+    # 核心模块:静态几何编码(坐标投影 -> GAT 残差层 -> Transformer)。
+    # rollout 时在 no_grad 下编码一次并复用;PPO 反向时需用当前权重带梯度重新编码。
     def encode_geometry(self, geometry_data: Data) -> StaticGeometry:
-        """Encode immutable geometry once after ``env.reset()``.
-
-        Do not call this with the live dynamic ``BatchCVRPEnv`` state when its
-        edge attributes contain changing traffic costs. Use coordinates or a
-        baseline-distance graph instead.
-
-        Rollout: call under no_grad and reuse for this unchanged instance.
-        PPO backward: call again with gradients enabled using current weights;
-        never use a detached rollout cache to train the geometry encoder.
-        """
-        batch = self._validate_batch(geometry_data)
-        if geometry_data.x.size(-1) < self.geometry_input_dim:
-            raise ValueError("geometry_data.x has fewer columns than geometry_input_dim.")
-        x = geometry_data.x[:, : self.geometry_input_dim].float()
-        x = self.geometry_projection(x)
+        batch = geometry_data.batch
+        x = self.geometry_projection(geometry_data.x[:, : self.geometry_input_dim].float())
         edge_attr = self._geometry_edge_attr(geometry_data)
         for layer in self.static_gats:
             x = x + layer(x, geometry_data.edge_index, edge_attr=edge_attr)
@@ -231,7 +167,7 @@ class GeometryDynamicPointerPolicy(nn.Module):
             return torch.is_autocast_enabled()
 
     def _can_cache_static_fusion(self, static: Tensor) -> bool:
-        # Backward always uses the original complete fusion layer.
+        # 反向传播始终走完整融合层
         return (
             self.cache_static_fusion
             and not torch.is_grad_enabled()
@@ -254,13 +190,9 @@ class GeometryDynamicPointerPolicy(nn.Module):
             static.dtype,
         )
 
+    # 核心模块:节点融合 Linear([static, dynamic]) = W_s*static + b + W_d*dynamic。
+    # 无梯度时可复用几何项 W_s*static + b,浮点运算顺序略有不同。
     def _fuse_nodes(self, static: Tensor, dynamic: Tensor, geometry: StaticGeometry) -> Tensor:
-        """Same affine map; optionally reuse its geometry-only term.
-
-        Linear([static,dynamic]) = W_s*static + bias + W_d*dynamic.
-        No-gradient float32/float64 calls may reuse the first term. The order
-        of floating-point operations differs slightly from the original path.
-        """
         cached = geometry.fusion_static
         if (
             cached is not None
@@ -273,16 +205,13 @@ class GeometryDynamicPointerPolicy(nn.Module):
             return self.node_fusion[2](self.node_fusion[1](fused))
         return self.node_fusion(torch.cat((static, dynamic), dim=-1))
 
-    def _prepare_latent(self, z: Tensor, batch_size: int, dtype: torch.dtype, device: torch.device) -> Tensor:
+    @staticmethod
+    def _prepare_latent(z: Tensor, batch_size: int, dtype: torch.dtype, device: torch.device) -> Tensor:
         z = torch.as_tensor(z, dtype=dtype, device=device)
         if z.ndim == 1:
             z = z.unsqueeze(0)
-        if z.ndim != 2 or z.size(1) != self.latent_dim:
-            raise ValueError(f"z must have shape [B, {self.latent_dim}] or [{self.latent_dim}].")
         if z.size(0) == 1 and batch_size > 1:
             z = z.expand(batch_size, -1)
-        if z.size(0) != batch_size:
-            raise ValueError("The z batch dimension must be 1 or equal to the graph batch size.")
         return z
 
     @staticmethod
@@ -290,54 +219,31 @@ class GeometryDynamicPointerPolicy(nn.Module):
         weights = mask.unsqueeze(-1).to(values.dtype)
         return (values * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
 
-    def _dynamic_dense(self, dynamic_data: Data, expected_mask: Tensor) -> Tuple[Tensor, Tensor]:
-        batch = self._validate_batch(dynamic_data)
-        if dynamic_data.x.size(-1) != self.dynamic_input_dim:
-            raise ValueError(
-                f"dynamic data must have {self.dynamic_input_dim} features, got {dynamic_data.x.size(-1)}."
-            )
-        if not hasattr(dynamic_data, "node_aux") or not hasattr(dynamic_data, "context"):
-            raise ValueError("Scheme B Actor requires node_aux and context from the revised BatchCVRPEnv")
+    # 核心模块:动态特征编码。6 维节点特征 + (node_aux 3 维 + 环境 context 前 2 维) 的辅助特征。
+    def _dynamic_dense(self, dynamic_data: Data) -> Tuple[Tensor, Tensor]:
         env_context = dynamic_data.context[dynamic_data.batch, :2]
         auxiliary = torch.cat((dynamic_data.node_aux, env_context), dim=-1).float()
         dynamic = self.dynamic_encoder(dynamic_data.x.float()) + self.auxiliary_encoder(auxiliary)
-        dense, mask = to_dense_batch(dynamic, batch)
-        if mask.shape != expected_mask.shape or not torch.equal(mask, expected_mask):
-            raise ValueError("Geometry and dynamic state must have identical batch layout and node order.")
-        return dense, mask
+        return to_dense_batch(dynamic, dynamic_data.batch)
 
+    # 核心模块:前向。查询 = MLP([图摘要, 动态摘要, 当前节点嵌入, z]) -> 交叉注意力 -> 指针打分
+    # -> tanh 截断 -> 非法节点填最小值。返回 [B, max_nodes] 的 masked logits。
     def forward(
         self, dynamic_data: Data, geometry: StaticGeometry, z: Tensor, action_mask: Optional[Tensor] = None
     ) -> Tensor:
-        """Return masked next-node logits with shape ``[B, max_nodes]``.
-
-        ``action_mask`` is True for legal actions. Its shape must match the
-        output dense-node layout. Padding is always made illegal.
-        """
         static = geometry.node_embeddings
-        if geometry.batch.shape != dynamic_data.batch.shape or not torch.equal(geometry.batch, dynamic_data.batch):
-            raise ValueError("Cached geometry batch layout changed; rebuild geometry after reset.")
-        dynamic, mask = self._dynamic_dense(dynamic_data, geometry.padding_mask)
-        if static.shape[:2] != dynamic.shape[:2]:
-            raise ValueError("Cached geometry and dynamic state do not have matching node dimensions.")
-        batch_size, node_count, _ = static.shape
+        dynamic, mask = self._dynamic_dense(dynamic_data)
+        batch_size = static.size(0)
         z = self._prepare_latent(z, batch_size, static.dtype, static.device)
 
         node_embeddings = self._fuse_nodes(static, dynamic, geometry)
         graph_summary = geometry.graph_summary
         if graph_summary is None:
-            # Support manually constructed three-field StaticGeometry objects.
             graph_summary = self._masked_mean(static, mask)
         dynamic_summary = self._masked_mean(dynamic, mask)
 
-        current_flag = dynamic_data.x[:, 3].float()
-        current_dense, current_mask = to_dense_batch(current_flag, dynamic_data.batch)
-        if not torch.equal(current_mask, mask):
-            raise ValueError("Current-node feature layout does not match graph layout.")
+        current_dense, _ = to_dense_batch(dynamic_data.x[:, 3].float(), dynamic_data.batch)
         current_weights = current_dense * mask.to(current_dense.dtype)
-        if not torch.is_grad_enabled() and bool((current_weights.sum(dim=1) <= 0).any()):
-            raise ValueError("state has no current-node flag in x[:, 3]")
-
         current_weights = current_weights / current_weights.sum(dim=1, keepdim=True).clamp_min(1.0)
         current_embedding = (node_embeddings * current_weights.unsqueeze(-1)).sum(dim=1)
 
@@ -357,13 +263,7 @@ class GeometryDynamicPointerPolicy(nn.Module):
 
         legal = mask.clone()
         if action_mask is not None:
-            action_mask = torch.as_tensor(action_mask, dtype=torch.bool, device=logits.device)
-            if action_mask.shape != legal.shape:
-                raise ValueError(f"action_mask must have shape {tuple(legal.shape)}.")
-            legal &= action_mask
-        no_legal = ~legal.any(dim=1)
-        if no_legal.any():
-            raise ValueError("No legal action; masks must include done-row depot")
+            legal &= torch.as_tensor(action_mask, dtype=torch.bool, device=logits.device)
         return logits.masked_fill(~legal, torch.finfo(logits.dtype).min)
 
     def distribution(
@@ -379,37 +279,23 @@ class GeometryDynamicPointerPolicy(nn.Module):
         action_mask: Optional[Tensor] = None,
         deterministic: bool = False,
     ):
-        """Return ``action, log_prob, entropy, logits`` for one rollout step."""
+        """返回 action, log_prob, entropy, logits。"""
         logits = self.forward(dynamic_data, geometry, z, action_mask)
         dist = Categorical(logits=logits)
         action = logits.argmax(dim=-1) if deterministic else dist.sample()
         return action, dist.log_prob(action), dist.entropy(), logits
 
 
+# 核心模块:按动态状态的批次顺序构造静态几何图。优先使用真实归一化坐标;
+# 无坐标时用基准距离矩阵做经典 MDS。edge_attr 使用基准距离(不含交通变化)。
 def build_geometry_data(
     dynamic_data: Data, baseline_distance_matrix, coords: Optional[Tensor] = None, coordinate_dim: int = 2
 ) -> Data:
-    """Build a static PyG graph in the exact batch order of ``dynamic_data``.
-
-    Preferred usage passes actual normalized coordinates via ``coords``.
-    If coordinates are unavailable, this creates two-dimensional classical-MDS
-    coordinates from the supplied symmetric baseline distance matrix. The
-    result uses baseline (not traffic) distances as ``edge_attr``.
-    """
-    if not hasattr(dynamic_data, "edge_index") or not hasattr(dynamic_data, "batch"):
-        raise ValueError("dynamic_data must include edge_index and batch.")
     device = dynamic_data.x.device
     batch = dynamic_data.batch
-    batch_size = int(batch.max().item()) + 1 if batch.numel() else 0
-    if batch_size < 1:
-        raise ValueError("dynamic_data contains no graphs.")
-    counts = torch.bincount(batch, minlength=batch_size)
-    if not torch.all(counts == counts[0]):
-        raise ValueError("All batch graphs must have the same number of nodes.")
-    n = int(counts[0].item())
+    batch_size = int(batch.max().item()) + 1
+    n = int(torch.bincount(batch, minlength=batch_size)[0].item())
     baseline = torch.as_tensor(baseline_distance_matrix, dtype=torch.float32, device=device)
-    if baseline.shape != (n, n):
-        raise ValueError(f"baseline_distance_matrix must have shape {(n, n)}.")
 
     if coords is None:
         squared = baseline.square()
@@ -423,8 +309,6 @@ def build_geometry_data(
             base_coords = torch.nn.functional.pad(base_coords, (0, coordinate_dim - take))
     else:
         base_coords = torch.as_tensor(coords, dtype=torch.float32, device=device)
-        if base_coords.ndim != 2 or base_coords.size(0) != n:
-            raise ValueError("coords must have shape [num_nodes, coordinate_dim].")
         if base_coords.size(1) < coordinate_dim:
             base_coords = torch.nn.functional.pad(base_coords, (0, coordinate_dim - base_coords.size(1)))
         base_coords = base_coords[:, :coordinate_dim]

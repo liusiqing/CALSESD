@@ -1,15 +1,11 @@
-"""Online Actor-controller value ensemble with static geometry caching.
+"""在线 Actor-控制器价值网络:集成 Critic + 静态几何缓存(精简版:已删除输入检查与缓存统计)。
 
-Context fusion: physical context[:2] (traffic phase, remaining episode fraction)
-online_context[6] + two task summaries.
-
-Targets must include the actual future online-controller switches. The network
-alone does not make old fixed-z GAE/returns correct; collector/update adaptation
-is still required. No environment transitions or parameter optimization here.
+状态特征 = 节点池化(全体/剩余客户/当前节点/仓库) + 物理 context[:2] + 在线触发器 online_context[6] + 2 个任务摘要。
+价值目标必须包含未来真实发生的在线隐变量切换;网络本身不保证旧的固定 z 目标正确。
+本模块不推进环境,也不优化参数。
 """
 
 from collections import OrderedDict
-from numbers import Integral
 import torch
 from torch import nn
 from torch_geometric.nn import GATv2Conv
@@ -22,8 +18,6 @@ ONLINE_VALUE_SEMANTICS = "online_actor_controller_v1"
 class ValueNetwork(nn.Module):
     def __init__(self, hidden_dim=128, dynamic_dim=64, latent_dim=16, n_critics=4, kind="hybrid", prior_scale=0.0):
         super().__init__()
-        if n_critics < 2 or kind != "hybrid":
-            raise ValueError("invalid value configuration")
         self.kind, self.latent_dim, self.n_critics = kind, latent_dim, n_critics
         H = hidden_dim
         self.online_context_dim = ONLINE_CONTEXT_DIM
@@ -47,8 +41,6 @@ class ValueNetwork(nn.Module):
             ]
         )
         self.prior_scale = float(prior_scale)
-        if self.prior_scale < 0:
-            raise ValueError("prior_scale must be non-negative")
         if self.prior_scale > 0:  # 冻结的随机先验:数据之外各 head 的差异被放大
             in_dim = self.state_feature_dim + latent_dim
             self.priors = nn.ModuleList(
@@ -56,48 +48,25 @@ class ValueNetwork(nn.Module):
             )
             for p in self.priors.parameters():
                 p.requires_grad_(False)
-        # Ordinary attributes: never serialized in state_dict, never shared with Actor.
+        # 普通属性:不进入 state_dict,不与 Actor 共享
         self.cache_static = True
         self.static_cache_size = 4
         self._static_cache = OrderedDict()
         self._static_cache_signature = None
         self._static_cache_next_key = 0
-        self._static_cache_hits = 0
-        self._static_cache_misses = 0
-        self._static_cache_bypasses = 0
 
-    def clear_static_cache(self, *, reset_stats=False):
-        """Drop cached tensors; call after nonstandard parameter edits via .data."""
+    def clear_static_cache(self):
         self._static_cache.clear()
         self._static_cache_signature = None
         self._static_cache_next_key = 0
-        if reset_stats:
-            self._static_cache_hits = 0
-            self._static_cache_misses = 0
-            self._static_cache_bypasses = 0
 
     def configure_static_cache(self, *, enabled=True, max_entries=4):
-        """Optional cache controls; no trainer/config changes are required."""
-        if not isinstance(enabled, bool):
-            raise ValueError("enabled must be bool")
-        if isinstance(max_entries, bool) or not isinstance(max_entries, Integral) or max_entries < 1:
-            raise ValueError("max_entries must be a positive integer")
         self.clear_static_cache()
         self.cache_static = enabled
         self.static_cache_size = int(max_entries)
 
-    def static_cache_info(self):
-        return dict(
-            enabled=self.cache_static,
-            max_entries=self.static_cache_size,
-            entries=len(self._static_cache),
-            hits=self._static_cache_hits,
-            misses=self._static_cache_misses,
-            bypasses=self._static_cache_bypasses,
-        )
-
     def _apply(self, fn, *args, **kwargs):
-        # .to(), .cuda(), .cpu(), dtype conversions must not retain old tensors.
+        # .to()/.cuda()/.cpu()/dtype 转换后不能保留旧设备上的缓存
         self.clear_static_cache()
         return super()._apply(fn, *args, **kwargs)
 
@@ -119,29 +88,21 @@ class ValueNetwork(nn.Module):
             return torch.is_autocast_enabled()
 
     def _geometry_signature(self):
-        # Optimizer/no_grad in-place updates increment Tensor._version.
+        # 优化器或 no_grad 的原地更新会增加 Tensor._version
         parameters = tuple((id(p), p._version, p.device, p.dtype) for p in self.geometry_encoder.parameters())
         modes = tuple(module.training for module in self.geometry_encoder.modules())
         return parameters, modes
 
+    # 核心模块:坐标编码及有界 LRU 缓存。带梯度、inference_mode 或 autocast 时总是重算,
+    # 保证反向传播不会使用被 detach 的 rollout 缓存。
     def encode_static(self, state):
-        """Encode coordinates only; exact row-wise position matching, bounded LRU.
-
-        Gradient-enabled calls always recompute, including policy.eval() PPO
-        updates. Detached rollout geometry is never reused for backward.
-        """
         pos = state.pos.float()
-        if pos.ndim != 2 or pos.size(1) != 2:
-            raise ValueError("Critic expects pos with shape [N,2]")
-        if pos.size(0) != state.x.size(0):
-            raise ValueError("Critic position/node count mismatch")
         if (
             not self.cache_static
             or torch.is_grad_enabled()
             or torch.is_inference_mode_enabled()
             or self._autocast_active(pos.device.type)
         ):
-            self._static_cache_bypasses += 1
             self.clear_static_cache()
             return self.geometry_encoder(pos)
         signature = self._geometry_signature()
@@ -160,9 +121,7 @@ class ValueNetwork(nn.Module):
                 break
         if hit is not None:
             self._static_cache.move_to_end(hit)
-            self._static_cache_hits += 1
             return self._static_cache[hit][1]
-        self._static_cache_misses += 1
         embedding = self.geometry_encoder(pos)
         key = self._static_cache_next_key
         self._static_cache_next_key += 1
@@ -176,20 +135,10 @@ class ValueNetwork(nn.Module):
         weights = mask.to(x.dtype).unsqueeze(-1)
         return (x * weights).sum(1) / weights.sum(1).clamp_min(1.0)
 
+    # 核心模块:状态编码。节点融合 -> 一层 GATv2 残差 -> 四种池化 -> 拼接物理 context、
+    # 在线控制器 context 和两个任务摘要,得到 [B, state_feature_dim]。搜索时每个状态只编码一次。
     def encode_state(self, state):
-        if state.x.ndim != 2 or state.node_aux.ndim != 2:
-            raise ValueError("Critic expects node matrices x and node_aux")
-        if state.x.size(1) + state.node_aux.size(1) != 9:
-            raise ValueError("Critic expects 9 concatenated dynamic node features")
-        if state.context.ndim != 2 or state.context.size(1) < 2:
-            raise ValueError("Critic expects traffic phase and remaining episode fraction in context[:2]")
-        online = getattr(state, "online_context", None)
-        if not torch.is_tensor(online) or online.shape != (state.context.size(0), self.online_context_dim):
-            raise ValueError("Critic requires online_context[B,6]; bind the online trigger before producing state")
-        if not online.is_floating_point() or not bool(torch.isfinite(online).all()):
-            raise ValueError("online_context must be finite floating point")
-        if bool(((online < -1e-6) | (online > 1.0 + 1e-6)).any()):
-            raise ValueError("online_context must contain normalized controller features in [0,1]")
+        online = state.online_context
         node = self.fusion(
             torch.cat(
                 (self.encode_static(state), self.dynamic_encoder(torch.cat((state.x, state.node_aux), -1).float())), -1
@@ -202,8 +151,6 @@ class ValueNetwork(nn.Module):
         remaining = (aux[:, :, 0] > 0.5) & (x[:, :, 2] < 0.5) & valid
         current = (x[:, :, 3] > 0.5) & valid
         depot = (aux[:, :, 1] > 0.5) & valid
-        if dense.size(0) != state.context.size(0):
-            raise ValueError("Critic graph/context batch size mismatch")
         context = state.context[:, :2].to(dense)
         online = online.to(dense)
         counts = valid.sum(1).clamp_min(1).to(dense.dtype)
@@ -221,17 +168,12 @@ class ValueNetwork(nn.Module):
             -1,
         )
 
+    # 核心模块:集成价值头。输入 [状态特征, z],输出 [n_critics, B];可选加冻结随机先验。
     def evaluate_features(self, features, z):
-        if features.ndim != 2 or features.size(1) != self.state_feature_dim:
-            raise ValueError("online Critic state feature width mismatch")
         if z.ndim == 1:
             z = z[None, :]
-        if z.ndim != 2 or z.size(1) != self.latent_dim:
-            raise ValueError("latent shape mismatch")
         if z.size(0) == 1:
             z = z.expand(features.size(0), -1)
-        if z.size(0) != features.size(0):
-            raise ValueError("latent batch mismatch")
         inp = torch.cat((features, z.to(features)), -1)
         out = torch.stack([h(inp).squeeze(-1) for h in self.heads], 0)
         if self.prior_scale > 0:
@@ -250,6 +192,7 @@ class ValueNetwork(nn.Module):
     def disagreement(self, policy, state, geometry, z):
         return self.all_values(policy, state, geometry, z).std(0, unbiased=False)
 
+    # 核心模块:种群评价。把 B 个状态与 K 个候选 z 做笛卡尔积,返回 [n_critics, B, K]。
     def population_values(self, features, population):
         B, K = features.size(0), population.size(0)
         f = features[:, None, :].expand(B, K, -1).reshape(B * K, -1)
