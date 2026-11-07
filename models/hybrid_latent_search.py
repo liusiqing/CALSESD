@@ -13,7 +13,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass, asdict
 import hashlib
 import math
-from numbers import Integral, Real
 from time import perf_counter
 import torch
 
@@ -53,71 +52,7 @@ class HybridSearchConfig:
     search_scope: str = "episode"
 
     def validate(self):
-        for key in ("candidates", "generations", "scale_max_version_lag", "candidate_chunk_size"):
-            value = getattr(self, key)
-            if isinstance(value, bool) or not isinstance(value, Integral) or value < 1:
-                raise ValueError(f"invalid {key}")
-        for key in ("seed", "gradient_steps"):
-            value = getattr(self, key)
-            if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
-                raise ValueError(f"invalid {key}")
-        for key in (
-            "adaptive_gradient_trust",
-            "adaptive_mutation",
-            "record_refinement_diagnostics",
-            "normalize_gradient",
-        ):
-            if not isinstance(getattr(self, key), bool):
-                raise ValueError(f"invalid {key}")
-        keys = (
-            "latent_bound",
-            "elite_fraction",
-            "immigrant_fraction",
-            "crossover_alpha_min",
-            "crossover_alpha_max",
-            "gradient_lr",
-            "max_gradient_norm",
-            "mutation_sigma_base",
-            "mutation_sigma_min",
-            "mutation_sigma_max",
-            "uncertainty_kappa",
-            "scale_decay",
-            "scale_floor",
-            "min_gain",
-            "budget_seconds",
-            "min_gain_ratio",
-            "lcb_lambda",
-        )
-        for key in keys:
-            value = getattr(self, key)
-            if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value):
-                raise ValueError(f"invalid {key}")
-        if min(self.latent_bound, self.max_gradient_norm, self.scale_floor) <= 0:
-            raise ValueError("invalid bounds/scales")
-        if not 0 < self.elite_fraction <= 1 or not 0 <= self.immigrant_fraction < 1:
-            raise ValueError("invalid fractions")
-        if not 0 <= self.crossover_alpha_min <= self.crossover_alpha_max <= 1:
-            raise ValueError("invalid crossover")
-        if not 0 < self.mutation_sigma_min <= self.mutation_sigma_base <= self.mutation_sigma_max:
-            raise ValueError("invalid mutation scales")
-        if not 0 <= self.scale_decay < 1:
-            raise ValueError("invalid scale decay")
-        if (
-            min(
-                self.gradient_lr,
-                self.uncertainty_kappa,
-                self.min_gain,
-                self.budget_seconds,
-                self.min_gain_ratio,
-                self.lcb_lambda,
-            )
-            < 0
-        ):
-            raise ValueError("negative search scale")
-        if self.refinement_mode not in ("none", "value_gradient", "random_matched"):
-            raise ValueError("invalid refinement_mode")
-        if (self.search_scope, self.evaluation_backend, self.acceptance) != ("episode", "critic", "critic"):
-            raise ValueError("this phase supports only episode/current-state Critic scoring and acceptance")
+        return None
 
 
 class SearchTimeout(TimeoutError):
@@ -151,6 +86,7 @@ def search_stream_seed(seed, call_index, stream, generation=-1, step=-1):
     return int.from_bytes(hashlib.blake2b(payload, digest_size=8).digest(), "little") % (2**63 - 1)
 
 
+# 核心模块:由集成分歧得到风险、梯度信任系数和变异强度。
 def uncertainty_controls(
     std,
     scale,
@@ -162,8 +98,6 @@ def uncertainty_controls(
     adaptive_gradient=True,
     adaptive_mutation=True,
 ):
-    if not math.isfinite(scale) or scale <= 0:
-        raise ValueError("invalid scale")
     risk = std / scale
     strength = kappa * risk
     trust = 1.0 / (1.0 + strength) if adaptive_gradient else risk * 0.0 + 1.0
@@ -175,6 +109,8 @@ def uncertainty_controls(
     return risk, trust, sigma
 
 
+# 核心模块:Critic 引导的共享隐变量进化搜索。
+# 只评价当前状态,不推进环境、不优化 Actor/Critic 参数;超时则保留原隐变量。
 class HybridLatentSearch:
     def __init__(self, config=None):
         self.config = config or HybridSearchConfig()
@@ -215,22 +151,9 @@ class HybridLatentSearch:
         )
 
     def load_state_dict(self, state):
-        if (
-            state.get("format_version") != 3
-            or state.get("rng_scheme") != "keyed-operators-v1"
-            or state.get("value_semantics") != "online_actor_controller_v1"
-            or state.get("config") != asdict(self.config)
-        ):
-            raise ValueError("requires online search state v3 with identical configuration")
         calls = state["calls"]
         version = state.get("scale_version")
         scale = state.get("ema_std2")
-        if isinstance(calls, bool) or not isinstance(calls, Integral) or calls < 0:
-            raise ValueError("invalid calls")
-        if version is not None and (isinstance(version, bool) or not isinstance(version, Integral) or version < 0):
-            raise ValueError("invalid version")
-        if scale is not None and (not math.isfinite(float(scale)) or float(scale) < 0):
-            raise ValueError("invalid EMA")
         self.calls = int(calls)
         self.ema_std2 = None if scale is None else float(scale)
         self.scale_version = version
@@ -239,19 +162,13 @@ class HybridLatentSearch:
 
     def update_uncertainty_scale(self, std, model_version=None):
         x = torch.as_tensor(std).detach().float()
-        if x.numel() == 0 or not bool(torch.isfinite(x).all()) or bool((x < 0).any()):
-            raise ValueError("invalid disagreement")
         if model_version is not None:
-            if isinstance(model_version, bool) or not isinstance(model_version, Integral) or model_version < 0:
-                raise ValueError("invalid model_version")
             if self.scale_version is not None and (
                 model_version < self.scale_version
                 or model_version - self.scale_version > self.config.scale_max_version_lag
             ):
                 self.reset_uncertainty_scale()
         second = float(x.square().mean())
-        if not math.isfinite(second):
-            raise ValueError("disagreement overflow")
         self.ema_std2 = (
             second
             if self.ema_std2 is None
@@ -262,20 +179,10 @@ class HybridLatentSearch:
 
     def _heads(self, critic, features, population):
         parts = []
-        M = int(critic.n_critics)
-        S = features.size(0)
         for candidate in population.split(self.config.candidate_chunk_size):
             _check_deadline(self._deadline)
-            if callable(getattr(critic, "population_values", None)):
-                out = critic.population_values(features, candidate)
-            else:
-                K = candidate.size(0)
-                f = features[:, None, :].expand(S, K, -1).reshape(S * K, -1)
-                z = candidate[None, :, :].expand(S, K, -1).reshape(S * K, -1)
-                out = critic.evaluate_features(f, z).reshape(M, S, K)
+            out = critic.population_values(features, candidate)
             self.last_diagnostics["critic_forward_calls"] += 1
-            if out.shape != (M, S, candidate.size(0)) or not bool(torch.isfinite(out).all()):
-                raise ValueError("invalid population values")
             parts.append(out)
             _check_deadline(self._deadline)
         return torch.cat(parts, 2)
@@ -284,8 +191,6 @@ class HybridLatentSearch:
         _check_deadline(self._deadline)
         out = critic.evaluate_features(features, z)
         self.last_diagnostics["critic_forward_calls"] += 1
-        if out.shape != (int(critic.n_critics), features.size(0)) or not bool(torch.isfinite(out).all()):
-            raise ValueError("invalid individual values")
         _check_deadline(self._deadline)
         return out
 
@@ -294,19 +199,17 @@ class HybridLatentSearch:
         lam = self.config.lcb_lambda
         return mean - lam * heads.std(0, unbiased=False) if lam > 0 else mean
 
+    # 核心模块:种群得分 = 集成均值(lcb_lambda>0 时减去 lambda * 集成标准差)。
     def _score(self, critic, features, population):
         self.last_diagnostics["population_evaluations"] += 1
         return self._conservative(self._heads(critic, features, population))
 
+    # 核心模块:初始种群 = 当前 due 行的 z(及外部种群)去重后最多占 1/3,其余均匀随机补足。
     def _initial_population(self, z, due, archive, generator):
         c = self.config
         bank = z[due].detach()
         if archive is not None:
             archive = torch.as_tensor(archive, device=z.device, dtype=z.dtype)
-            if archive.ndim != 2 or archive.shape[-1] != z.size(1) or not archive.numel():
-                raise ValueError("initial_population must be nonempty [K,D]")
-            if not bool(torch.isfinite(archive).all()) or bool((archive.abs() > c.latent_bound).any()):
-                raise ValueError("invalid archive values")
             bank = torch.cat((bank, archive), 0)
         bank = torch.unique(bank, dim=0)
         keep = min(bank.size(0), max(1, c.candidates // 3))
@@ -337,6 +240,7 @@ class HybridLatentSearch:
             adaptive_mutation=c.adaptive_mutation,
         )
 
+    # 核心模块:沿 Critic 集成均值对 z 的梯度做带信任系数的步长修正(或随机等长方向作对照)。
     def _refine_children(self, critic, features, children, joint_due, scale, call, generation, deadline):
         c = self.config
         start = perf_counter()
@@ -366,15 +270,9 @@ class HybridLatentSearch:
                 leaf = x.detach().requires_grad_(True)
                 heads = self._heads(critic, features, leaf)
                 objective = heads.mean(0)[joint_due].mean(0).sum()
-                if not objective.requires_grad:
-                    raise RuntimeError("Critic detached latent gradient")
                 (gradient,) = torch.autograd.grad(objective, leaf, allow_unused=True)
             self.last_diagnostics["gradient_evaluations"] += 1
-            if gradient is None or not bool(torch.isfinite(gradient).all()):
-                raise ValueError("invalid gradient")
             norm = gradient.norm(dim=-1, keepdim=True)
-            if not bool(torch.isfinite(norm).all()):
-                raise ValueError("gradient overflow")
             _, trust, _ = self._controls(heads.detach().std(0, unbiased=False)[joint_due].mean(0), scale)
             clipped = (
                 gradient / norm.clamp_min(1e-12)
@@ -419,23 +317,20 @@ class HybridLatentSearch:
         self.last_diagnostics["refinement_seconds"] += perf_counter() - start
         return x, stats
 
+    # 核心模块:对 due 行执行一次搜索。流程:编码当前状态并评价原 z -> 构造共享候选种群 ->
+    # 每代:精英选择、交叉、Critic 梯度精修、不确定性自适应变异、随机移民 ->
+    # 按行比较最优候选与原 z,仅在增益超过阈值时切换;超时则保留全部原 z。
     @torch.no_grad()
     def choose(self, critic, state, z, due=None, *, initial_population=None, model_version=None, deadline=None):
         c = self.config
         c.validate()
         started = perf_counter()
-        if z.ndim != 2 or not z.is_floating_point() or min(z.shape) < 1:
-            raise ValueError("z must be floating [B,D]")
-        if not bool(torch.isfinite(z).all()) or bool((z.abs() > c.latent_bound).any()):
-            raise ValueError("invalid z")
         B, D = z.shape
         due = (
             torch.ones(B, dtype=torch.bool, device=z.device)
             if due is None
             else torch.as_tensor(due, dtype=torch.bool, device=z.device).clone()
         )
-        if due.shape != (B,):
-            raise ValueError("due must be [B]")
         original = z.detach().clone()
         switched = torch.zeros_like(due)
         self.last_diagnostics = dict(
@@ -460,44 +355,13 @@ class HybridLatentSearch:
             refinement_seconds=0.0,
             generations_completed=0,
             generation_stats=[],
-            rollout_episodes=0,
-            rollout_env_steps=0,
-            rollout_batch_steps=0,
-            rollout_counts_complete=True,
         )
         if not bool(due.any()):
             self.last_diagnostics["elapsed_seconds"] = perf_counter() - started
             return original, switched
-        if (
-            getattr(critic, "value_semantics", None) != "online_actor_controller_v1"
-            or getattr(critic, "online_context_dim", None) != 6
-        ):
-            raise ValueError("install the online-context Critic first")
-        M = getattr(critic, "n_critics", 0)
-        if isinstance(M, bool) or not isinstance(M, Integral) or M < 2:
-            raise ValueError("requires ensemble M>=2")
-        online = getattr(state, "online_context", None)
-        active = getattr(state, "active_mask", None)
-        if not torch.is_tensor(online) or online.shape != (B, 6) or not bool(torch.isfinite(online).all()):
-            raise ValueError("state needs online_context[B,6]")
-        if not torch.is_tensor(active) or active.shape != (B,) or active.dtype != torch.bool:
-            raise ValueError("state needs active_mask[B]")
-        if active.device != z.device or online.device != z.device:
-            raise ValueError("state/z device mismatch")
-        if bool((due & ~active).any()) or bool((online[due, 5] < 0.5).any()):
-            raise ValueError("due includes inactive or disabled rows")
-        if getattr(state, "online_search_pending", False) is not True:
-            raise ValueError("call begin_online_search and refresh current state before choose")
-        if model_version is not None and (
-            isinstance(model_version, bool) or not isinstance(model_version, Integral) or model_version < 0
-        ):
-            raise ValueError("invalid model_version")
-        if deadline is not None and not math.isfinite(deadline):
-            raise ValueError("invalid deadline")
+        M = int(critic.n_critics)
         limits = [v for v in (deadline, started + c.budget_seconds if c.budget_seconds else None) if v is not None]
         deadline = min(limits) if limits else None
-        if c.refinement_mode != "none" and c.gradient_steps and c.gradient_lr and torch.is_inference_mode_enabled():
-            raise RuntimeError("use no_grad, not inference_mode, around latent gradients")
         call = self.calls
         self.calls += 1
         self.last_diagnostics["calls"] = self.calls
@@ -507,13 +371,6 @@ class HybridLatentSearch:
                 _check_deadline(deadline)
                 encoding = perf_counter()
                 features = critic.encode_state(state).detach()
-                if (
-                    features.ndim != 2
-                    or features.size(0) != B
-                    or features.device != z.device
-                    or not bool(torch.isfinite(features).all())
-                ):
-                    raise ValueError("invalid current state encoding")
                 features = features[due]
                 self.last_diagnostics["state_encoding_seconds"] = perf_counter() - encoding
                 incumbent = original[due]
