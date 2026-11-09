@@ -1,6 +1,7 @@
 """消融实验到搜索配置的映射(回合内周期 Critic 引导搜索)。"""
 from __future__ import annotations
 from dataclasses import dataclass, field, asdict
+import math
 from .online_trigger import OnlineTriggerConfig, ONLINE_CONTEXT_FIELDS, ONLINE_CONTEXT_DIM
 
 VARIANTS = {
@@ -27,24 +28,72 @@ class AblationPlan:
     search_overrides: dict = field(default_factory=dict)
 
 
-# 核心模块:family/variant -> 搜索器参数覆盖。
-# exp1:比较精修方式(none / value_gradient / random_matched),关闭自适应;exp3:比较自适应梯度信任与自适应变异的组合。
+# 核心模块：将消融名称映射为搜索配置。
+# exp1 固定单步精修协议，比较 none/value_gradient/random_matched。
+# exp3 保持评分与接受规则不变，仅比较梯度信任和自适应变异。
 def resolve_ablation(cfg):
-    family, variant = cfg.ablation_family, cfg.ablation_variant
-    overrides = dict(refinement_mode="value_gradient", adaptive_gradient_trust=True, adaptive_mutation=True,
-                     record_refinement_diagnostics=cfg.ablation_record_diagnostics)
+    family = cfg.ablation_family
+    variant = cfg.ablation_variant
+
+    # 防止实验名称写错后静默运行成另一个实验。
+    if family not in VARIANTS or variant not in VARIANTS[family]:
+        raise ValueError(f"Unsupported ablation: {family}/{variant}")
+
+    if family != "none" and cfg.mode != "evolution":
+        raise ValueError("exp1/exp3 require mode=evolution")
+        
+    overrides = dict(refinement_mode="value_gradient",adaptive_gradient_trust=True,adaptive_mutation=True,
+                     record_refinement_diagnostics=cfg.ablation_record_diagnostics,
+    )
+
     if family == "exp1":
-        overrides.update(refinement_mode=variant, gradient_steps=1,
-                         adaptive_gradient_trust=False, adaptive_mutation=False)
+        # exp1 比较修正方向：不修正 / 价值梯度 / 投影前等长随机方向。
+        # value_gradient 和 random_matched 都需要非零参考步长。
+        if variant != "none" and cfg.gradient_lr <= 0:
+            raise ValueError(
+                "exp1 refinement variants require gradient_lr > 0"
+            )
+
+        overrides.update(
+            refinement_mode=variant,
+            gradient_steps=1,
+            adaptive_gradient_trust=False,
+            adaptive_mutation=False,
+        )
+        
     elif family == "exp3":
+        # 四个组都保留有效的梯度精修，避免开关退化为无效比较。
+        if (
+            cfg.gradient_steps < 1
+            or cfg.gradient_lr <= 0
+            or cfg.uncertainty_kappa <= 0
+        ):
+            raise ValueError(
+                "exp3 requires gradient_steps >= 1, "
+                "gradient_lr > 0 and uncertainty_kappa > 0"
+            )
+
         trust, mutation = TRUST_FLAGS[variant]
-        overrides.update(adaptive_gradient_trust=trust, adaptive_mutation=mutation)
+        overrides.update(adaptive_gradient_trust=trust,adaptive_mutation=mutation,)
+
     if cfg.ablation_fixed_sigma is not None:
-        overrides["mutation_sigma_base"] = cfg.ablation_fixed_sigma
+        # 自适应变异不使用 sigma_base；拒绝会被静默忽略的覆盖。
+        if overrides["adaptive_mutation"]:
+            raise ValueError("ablation_fixed_sigma requires fixed mutation")
+
+        sigma = cfg.ablation_fixed_sigma
+        if not cfg.mutation_sigma_min <= sigma <= cfg.mutation_sigma_max:
+            raise ValueError("ablation_fixed_sigma must lie within mutation bounds")
+
+        overrides["mutation_sigma_base"] = sigma
+
     if cfg.ablation_min_gain is not None:
         overrides["min_gain"] = cfg.ablation_min_gain
+
     trigger = OnlineTriggerConfig.from_config(cfg)
-    return AblationPlan(family, variant, "episode", "critic", "periodic", trigger.warmup_updates, overrides)
+
+    return AblationPlan(family=family,variant=variant,search_scope="episode",evaluation_backend="critic",
+        schedule="periodic",warmup_updates=trigger.warmup_updates,search_overrides=overrides,)
 
 
 # 核心模块:由训练配置与消融覆盖构造 HybridSearchConfig。
