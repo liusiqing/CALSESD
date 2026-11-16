@@ -13,7 +13,7 @@
 - 含 mermaid 流程图：reset → 触发器 → （到期行）z 进化搜索 → 刷新状态 → Actor 采样 → env.step → 回到触发器。
 
 ## 仓库结构
-env/、models/、training/ 各文件的一行说明（cvrp_env、cvrp_euclidean_env、batch_env、online_state、traffic；policy、value、hybrid_latent_search；train_ppo、ppo_config、ppo_rollout、ppo_update、online_trigger、ablation_config、validation、checkpoint、compact_logging、env_factory、inference_timing、rng_state），以及 pyproject.toml。
+env/、models/、training/ 各文件的一行说明（cvrp_env、cvrp_euclidean_env、batch_env、online_state、traffic；policy、value、hybrid_latent_search；train_ppo），以及 pyproject.toml。
 
 ## 环境细节
 实例规模（12×12 网格、100 客户、容量 15）、需求模型、交通模型（relative/additive）、观测维度（6 + 3 + 2，Critic 另读 6 维在线上下文）、奖励（−cost/norm_dist，失败惩罚，reward_scale）、并行方式。
@@ -32,8 +32,3 @@ none/default；exp1（none、value_gradient、random_matched）；exp3（fixed�
 
 ## 开发
 ruff check 与 black 命令（配置在 pyproject.toml）。
-
-## 已知限制
-同批共享单实例；仅支持 Critic 打分的搜索（rollout 评估后端未接入）；检查点只加载可信文件（weights_only=False）。
-
-（以上为摘要；实际写入的是 intended_arguments 中的完整 Markdown 原文。）
